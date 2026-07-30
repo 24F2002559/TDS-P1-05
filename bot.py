@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Data‑Analyst Telegram Bot – RAW HTTP polling.
-Free providers: AiPipe (GPT-4, GPT-3.5), OpenRouter (free models), Hugging Face.
-Gemini is skipped (quota exhausted). Groq/Together are optional.
+Data-Analyst Telegram Bot – RAW HTTP polling.
+Free providers: AiPipe (GPTs), OpenRouter (free models), Hugging Face.
+Gemini temporarily skipped (quota exceeded). Groq/Together optional.
 """
 
 import os, sys, json, time, threading, base64, traceback
@@ -22,13 +22,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL = os.environ["BASE_URL"]
 
 AIPIPE_API_KEY = os.environ.get("AIPIPE_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")   # currently unused (quota)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")       # optional
+TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")# optional
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 HF_API_KEY = os.environ.get("HF_API_KEY", "")
-
-# Optional – uncomment if you set these later
-# GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-# GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-# TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
@@ -157,18 +155,24 @@ def call_huggingface(model, messages):
     return None
 
 # ------------------------------------------------------------
-# 7. Unified LLM caller (AiPipe → OpenRouter → HF)
+# 7. Unified LLM caller (AiPipe → OpenRouter → HF → optional Groq/Together)
 # ------------------------------------------------------------
 def call_llm(messages, tools=None):
     use_tools = tools is not None
     log("Trying LLM providers...")
 
-    # 0. AiPipe (free GPT-4 / GPT-3.5)
+    # ---- 0. AiPipe (free GPT models – cheap & reliable) ----
     if AIPIPE_API_KEY:
         log("  [0] AiPipe")
-        for model in ["gpt-4", "gpt-3.5-turbo"]:   # models that support temperature=0
+        for model in [
+            "gpt-4",
+            "gpt-3.5-turbo",
+            "gpt-4o-mini",
+            "gpt-4-turbo",
+            "gpt-4-0613"
+        ]:
             res = call_openai_compatible(
-                "https://aipipe.org/openai/v1",     # correct base URL
+                "https://aipipe.org/openai/v1",
                 AIPIPE_API_KEY,
                 model,
                 messages,
@@ -177,9 +181,12 @@ def call_llm(messages, tools=None):
             if res is not None:
                 return res
 
-    # 1. OpenRouter (real free models)
+    # ---- (Gemini skipped – quota exceeded) ----
+    # if GEMINI_API_KEY: ...
+
+    # ---- 4. OpenRouter (real free models) ----
     if OPENROUTER_API_KEY:
-        log("  [1] OpenRouter")
+        log("  [4] OpenRouter")
         for model in [
             "meta-llama/llama-3.2-3b-instruct:free",
             "mistralai/mistral-7b-instruct:free",
@@ -196,13 +203,17 @@ def call_llm(messages, tools=None):
             if res is not None:
                 return res
 
-    # 2. Hugging Face (text only, no tools)
+    # ---- 5. Hugging Face (text only, no tools) ----
     if not use_tools and HF_API_KEY:
-        log("  [2] Hugging Face")
+        log("  [5] Hugging Face")
         for model in ["mistralai/Mistral-7B-Instruct-v0.3"]:
             res = call_huggingface(model, messages)
             if res is not None:
                 return res
+
+    # Optional: Groq and Together if keys are set (uncomment if you have them)
+    # if GROQ_API_KEY: ...
+    # if TOGETHER_API_KEY: ...
 
     log("  All providers failed.")
     return None
