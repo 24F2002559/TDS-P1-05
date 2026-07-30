@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-python-telegram-bot==21.9
 requests
 pandas
 numpy
