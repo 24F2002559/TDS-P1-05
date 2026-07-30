@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-telegram-bot==20.7
+openai
+pandas
+numpy
+requests
+beautifulsoup4
+openpyxl
+httpx
