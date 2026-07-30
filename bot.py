@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Data-Analyst Telegram Bot – FREE tier only.
-Uses OpenRouter free models (with tool calling) + Hugging Face Inference API as fallback.
+Primary: AiPipe (OpenAI-compatible) → OpenRouter → Hugging Face.
 Answers every message with a single JSON object.
 """
 
@@ -22,16 +22,23 @@ from fastapi.responses import PlainTextResponse
 from telegram.ext import Application, MessageHandler, filters
 
 # ----------------------------------------------------------------------
-# Environment configuration
+# Configuration from environment
 # ----------------------------------------------------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL = os.environ["BASE_URL"]                     # your public Render URL
+
+# API keys – only set the ones you actually use
+AIPIPE_API_KEY = os.environ.get("AIPIPE_API_KEY", "")
+AIPIPE_BASE_URL = os.environ.get("AIPIPE_BASE_URL", "https://api.aipipe.ai/v1")
+
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 HF_API_KEY = os.environ.get("HF_API_KEY", "")
 
 # ----------------------------------------------------------------------
 # Free model lists (order matters – first successful wins)
 # ----------------------------------------------------------------------
+AIPIPE_MODELS = ["aipipe-v1"]  # AiPipe's default model; adjust if needed
+
 OPENROUTER_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemini-2.0-flash-001",
@@ -87,84 +94,119 @@ SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code, so 
 - If unsure, still answer as best you can. Output ONLY the JSON."""
 
 # ----------------------------------------------------------------------
+# Call a single LLM provider (OpenAI‑compatible API)
+# ----------------------------------------------------------------------
+def call_openai_compatible(base_url: str, api_key: str, model: str, messages: list, tools: Optional[list] = None) -> Optional[str]:
+    """Send a chat completion request to an OpenAI‑compatible endpoint.
+    Returns text content (or a special JSON string if tool call is needed)."""
+    url = f"{base_url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+        if resp.status_code == 200:
+            data = resp.json()
+            choice = data["choices"][0]
+            msg = choice.get("message", {})
+            # If tool_calls present, return a special JSON marker
+            if tools and msg.get("tool_calls"):
+                return json.dumps({"message": msg})
+            # Otherwise, return the text content
+            return msg.get("content", "")
+    except Exception:
+        pass
+    return None
+
+# ----------------------------------------------------------------------
+# Hugging Face text‑generation call (no tools)
+# ----------------------------------------------------------------------
+def call_huggingface(model: str, messages: list) -> Optional[str]:
+    """Call Hugging Face Inference API (text generation only)."""
+    if not HF_API_KEY:
+        return None
+    # Convert messages to a single prompt string
+    prompt = "\n".join(
+        f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}"
+        for m in messages if m['role'] != 'system'
+    )
+    if messages and messages[0]['role'] == 'system':
+        prompt = f"System: {messages[0]['content']}\n{prompt}"
+
+    try:
+        resp = requests.post(
+            f"https://api-inference.huggingface.co/models/{model}",
+            headers={"Authorization": f"Bearer {HF_API_KEY}"},
+            json={
+                "inputs": prompt,
+                "parameters": {
+                    "max_new_tokens": 1024,
+                    "temperature": 0.0,
+                    "return_full_text": False,
+                },
+            },
+            timeout=180,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data:
+                return data[0].get("generated_text", "")
+            elif isinstance(data, dict):
+                return data.get("generated_text", "")
+    except Exception:
+        pass
+    return None
+
+# ----------------------------------------------------------------------
 # Unified LLM caller with fallback chain
 # ----------------------------------------------------------------------
 def call_llm(messages: list, tools: Optional[list] = None) -> Optional[str]:
     """
-    Try OpenRouter free models first (support tools), then HF models (no tools).
-    Returns the text output of the model, or None if everything fails.
+    Try free providers in order:
+    1. AiPipe (tools supported)
+    2. OpenRouter free models (tools supported)
+    3. Hugging Face free models (no tools, only used if tools=None)
     """
     use_tools = tools is not None
 
-    # ---- OpenRouter (OpenAI-compatible chat API) ----
+    # 1. AiPipe (OpenAI‑compatible)
+    if AIPIPE_API_KEY:
+        for model in AIPIPE_MODELS:
+            result = call_openai_compatible(AIPIPE_BASE_URL, AIPIPE_API_KEY, model, messages, tools if use_tools else None)
+            if result is not None:
+                return result
+
+    # 2. OpenRouter free models (OpenAI‑compatible)
     if OPENROUTER_API_KEY:
         for model in OPENROUTER_MODELS:
-            try:
-                payload = {
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0,
-                }
-                if use_tools:
-                    payload["tools"] = tools
-                    payload["tool_choice"] = "auto"
+            result = call_openai_compatible("https://openrouter.ai/api/v1", OPENROUTER_API_KEY, model, messages, tools if use_tools else None)
+            if result is not None:
+                return result
 
-                resp = requests.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=180,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    choice = data["choices"][0]
-                    msg = choice.get("message", {})
-                    # If the model returns a tool call, pack the whole message
-                    if use_tools and msg.get("tool_calls"):
-                        return json.dumps({"message": msg})
-                    content = msg.get("content", "")
-                    return content
-            except Exception:
-                continue
-
-    # ---- Hugging Face Inference API (no native tools) ----
-    if HF_API_KEY and not use_tools:
+    # 3. Hugging Face (text generation only, no tool support)
+    if use_tools:
+        # Fallback to a no‑tool call with system prompt warning
+        no_tools_messages = [{"role": "system", "content": SYSTEM_PROMPT_NO_TOOLS}] + messages[1:]
         for model in HF_MODELS:
-            try:
-                # Convert messages to a single prompt
-                prompt = "\n".join(
-                    f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}"
-                    for m in messages if m['role'] != 'system'
-                )
-                if messages and messages[0]['role'] == 'system':
-                    prompt = f"System: {messages[0]['content']}\n{prompt}"
+            result = call_huggingface(model, no_tools_messages)
+            if result is not None:
+                return result
+    else:
+        for model in HF_MODELS:
+            result = call_huggingface(model, messages)
+            if result is not None:
+                return result
 
-                resp = requests.post(
-                    f"https://api-inference.huggingface.co/models/{model}",
-                    headers={"Authorization": f"Bearer {HF_API_KEY}"},
-                    json={
-                        "inputs": prompt,
-                        "parameters": {
-                            "max_new_tokens": 1024,
-                            "temperature": 0.0,
-                            "return_full_text": False,
-                        },
-                    },
-                    timeout=180,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, list) and data:
-                        return data[0].get("generated_text", "")
-                    elif isinstance(data, dict):
-                        return data.get("generated_text", "")
-            except Exception:
-                continue
-
-    # All attempts exhausted
     return None
 
 # ----------------------------------------------------------------------
@@ -207,7 +249,7 @@ def agent_loop(history: list) -> str:
         if raw is None:
             return '{"answer": "service unavailable", "log_url": "LOG_URL_PLACEHOLDER"}'
 
-        # OpenRouter tool call packed as JSON string
+        # Detect tool call marker (returned by OpenAI‑compatible providers)
         if raw.startswith('{"message":'):
             try:
                 msg = json.loads(raw)["message"]
@@ -244,11 +286,11 @@ def agent_loop(history: list) -> str:
                 tool_calls_done += 1
                 continue
             else:
-                # No tool calls – this is the final answer
+                # No tool calls – final answer
                 raw = msg.get("content", "")
                 return raw
 
-        # Plain text answer (or HuggingFace fallback)
+        # Plain text answer (or Hugging Face fallback)
         return raw
 
 # ----------------------------------------------------------------------
@@ -279,13 +321,16 @@ def process_llm_output(raw_output: str) -> dict:
     return data
 
 # ----------------------------------------------------------------------
-# Per‑chat history (for multi‑turn conversations)
+# Per‑chat history
 # ----------------------------------------------------------------------
 history_store = {}
 
 async def handle_message(update, context):
     chat_id = update.effective_chat.id
     user_text = update.message.text
+
+    # Always print incoming for debugging (appears in Render logs)
+    print(f"MSG from {chat_id}: {user_text}", flush=True)
 
     if chat_id not in history_store:
         history_store[chat_id] = []
@@ -314,14 +359,27 @@ async def handle_message(update, context):
             "error": str(e),
             "traceback": traceback.format_exc()
         })
+        print(f"ERROR handling {chat_id}: {traceback.format_exc()}", flush=True)
 
-    await context.bot.send_message(chat_id=chat_id, text=reply_text)
+    # Send reply – using the library, with raw HTTP fallback
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=reply_text)
+    except Exception:
+        # Fallback: raw Telegram API call
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": reply_text}
+            )
+        except Exception:
+            pass
+
     history_store[chat_id].append({"role": "assistant", "content": reply_text})
     if len(history_store[chat_id]) > 20:
         history_store[chat_id] = history_store[chat_id][-20:]
 
 # ----------------------------------------------------------------------
-# FastAPI application (health check + public log)
+# FastAPI app
 # ----------------------------------------------------------------------
 app = FastAPI()
 
@@ -335,7 +393,7 @@ def run_log():
     return PlainTextResponse(content, media_type="text/plain")
 
 # ----------------------------------------------------------------------
-# Keep‑alive thread (internal self‑ping, helps but not sufficient alone)
+# Keep‑alive thread
 # ----------------------------------------------------------------------
 def keep_alive():
     while True:
@@ -346,9 +404,10 @@ def keep_alive():
             pass
 
 # ----------------------------------------------------------------------
-# Main entry point
+# Main
 # ----------------------------------------------------------------------
 def run_bot():
+    print("Starting Telegram bot polling...", flush=True)
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.run_polling()
