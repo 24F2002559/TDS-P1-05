@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Data-Analyst Telegram Bot – FREE multi‑provider (Gemini / Groq / Together / OpenRouter / HF).
-Supports tool‑calling, answers with a single JSON object, logs to GitHub.
+Data-Analyst Telegram Bot – RAW HTTP polling (no async/event-loop).
+Free multi‑provider LLM chain: AiPipe → Gemini → Groq → Together → OpenRouter → HuggingFace.
+Answers every message with a single JSON object.
 """
 
 import os, sys, json, time, threading, base64, traceback
@@ -13,34 +14,34 @@ import requests
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
-from telegram.ext import Application, MessageHandler, filters
 
 # ------------------------------------------------------------
-# Configuration (all from environment)
+# 1. Configuration (all from environment)
 # ------------------------------------------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL = os.environ["BASE_URL"]                        # your Render URL
 
-# --- LLM API keys (all free) ---
+# --- LLM API keys (all free – set the ones you have) ---
+AIPIPE_API_KEY = os.environ.get("AIPIPE_API_KEY", "")    # aipipe.ai
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")    # aistudio.google.com
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")        # console.groq.com/keys
 TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")# together.ai/settings/api-keys
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 HF_API_KEY = os.environ.get("HF_API_KEY", "")
 
-# --- GitHub logging ---
+# --- GitHub logging (optional) ---
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "run.jsonl")
 
 # ------------------------------------------------------------
-# Logging to stderr (visible in Render logs)
+# 2. Logging helper (stderr → Render logs)
 # ------------------------------------------------------------
 def log(msg: str):
     print(msg, file=sys.stderr, flush=True)
 
 # ------------------------------------------------------------
-# Global log (local backup) + GitHub push
+# 3. Global log list (local backup) + GitHub sync
 # ------------------------------------------------------------
 local_log_lines = []
 
@@ -73,7 +74,7 @@ def _push_to_github(json_line: str):
         log(f"GitHub push error: {e}")
 
 # ------------------------------------------------------------
-# Safe Python sandbox
+# 4. Safe Python sandbox
 # ------------------------------------------------------------
 def run_python(code: str) -> str:
     old_stdout = sys.stdout
@@ -95,7 +96,7 @@ def run_python(code: str) -> str:
     return mystdout.getvalue()[-8000:]
 
 # ------------------------------------------------------------
-# System prompts
+# 5. System prompts
 # ------------------------------------------------------------
 SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON object. Use `run_python` to fetch/compute.
 - Answer the LAST user message; earlier ones are context.
@@ -109,7 +110,7 @@ SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code. Giv
 - Output ONLY the JSON."""
 
 # ------------------------------------------------------------
-# Multi‑provider LLM caller with extensive free fallbacks
+# 6. Multi‑provider LLM helpers
 # ------------------------------------------------------------
 def call_openai_compatible(base_url, api_key, model, messages, tools=None):
     url = f"{base_url}/chat/completions"
@@ -127,7 +128,7 @@ def call_openai_compatible(base_url, api_key, model, messages, tools=None):
                 return json.dumps({"message": msg})   # tool call signal
             return msg.get("content", "")
     except Exception as e:
-        log(f"Error calling {model}: {e}")
+        log(f"OpenAI compat error ({model}): {e}")
     return None
 
 def call_huggingface(model, messages):
@@ -153,42 +154,50 @@ def call_huggingface(model, messages):
         log(f"HF error: {e}")
     return None
 
-def call_llm(messages: list, tools: Optional[list] = None) -> Optional[str]:
+# ------------------------------------------------------------
+# 7. Unified LLM caller (AiPipe → Gemini → Groq → Together → OpenRouter → HF)
+# ------------------------------------------------------------
+def call_llm(messages, tools=None):
     use_tools = tools is not None
 
-    # 1. Gemini (Google AI Studio)
-    if GEMINI_API_KEY:
-        for model in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]:
-            res = call_openai_compatible(
-                "https://generativelanguage.googleapis.com/v1beta/openai",
-                GEMINI_API_KEY, model, messages, tools if use_tools else None)
+    # 0. AiPipe
+    if AIPIPE_API_KEY:
+        for model in ["aipipe-v1"]:
+            res = call_openai_compatible("https://api.aipipe.ai/v1", AIPIPE_API_KEY, model, messages, tools if use_tools else None)
             if res is not None:
                 return res
 
-    # 2. Groq (free tier)
+    # 1. Gemini (Google AI Studio)
+    if GEMINI_API_KEY:
+        for model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+            res = call_openai_compatible("https://generativelanguage.googleapis.com/v1beta/openai", GEMINI_API_KEY, model, messages, tools if use_tools else None)
+            if res is not None:
+                return res
+
+    # 2. Groq
     if GROQ_API_KEY:
-        for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it", "mixtral-8x7b-32768"]:
+        for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
             res = call_openai_compatible("https://api.groq.com/openai/v1", GROQ_API_KEY, model, messages, tools if use_tools else None)
             if res is not None:
                 return res
 
-    # 3. Together AI (free credits, OpenAI‑compatible)
+    # 3. Together AI
     if TOGETHER_API_KEY:
-        for model in ["meta-llama/Llama-3.3-70B-Instruct-Turbo-Free", "mistralai/Mistral-7B-Instruct-v0.1"]:
+        for model in ["meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"]:
             res = call_openai_compatible("https://api.together.xyz/v1", TOGETHER_API_KEY, model, messages, tools if use_tools else None)
             if res is not None:
                 return res
 
-    # 4. OpenRouter (free models)
+    # 4. OpenRouter
     if OPENROUTER_API_KEY:
-        for model in ["meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-001", "mistralai/mistral-7b-instruct:free"]:
+        for model in ["meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-001"]:
             res = call_openai_compatible("https://openrouter.ai/api/v1", OPENROUTER_API_KEY, model, messages, tools if use_tools else None)
             if res is not None:
                 return res
 
-    # 5. Hugging Face (text only, no tools)
+    # 5. Hugging Face (text‑only, no tools)
     if not use_tools:
-        for model in ["mistralai/Mistral-7B-Instruct-v0.3", "HuggingFaceH4/zephyr-7b-beta"]:
+        for model in ["mistralai/Mistral-7B-Instruct-v0.3"]:
             res = call_huggingface(model, messages)
             if res is not None:
                 return res
@@ -196,9 +205,9 @@ def call_llm(messages: list, tools: Optional[list] = None) -> Optional[str]:
     return None
 
 # ------------------------------------------------------------
-# Agent loop (LLM + tool execution)
+# 8. Agent loop (LLM + tool execution)
 # ------------------------------------------------------------
-def agent_loop(history: list) -> str:
+def agent_loop(history):
     deadline = time.time() + 210
     max_tool_calls = 10
     done = 0
@@ -254,9 +263,9 @@ def agent_loop(history: list) -> str:
         return raw
 
 # ------------------------------------------------------------
-# JSON extraction and answer shaping
+# 9. JSON extraction & answer shaping
 # ------------------------------------------------------------
-def extract_json(text: str) -> dict:
+def extract_json(text):
     start = text.find('{')
     if start == -1:
         raise ValueError("No JSON")
@@ -269,7 +278,7 @@ def extract_json(text: str) -> dict:
                 return json.loads(text[start:i+1])
     raise ValueError("Unbalanced")
 
-def process_llm_output(raw: str) -> dict:
+def process_llm_output(raw):
     try:
         data = extract_json(raw)
     except:
@@ -280,15 +289,11 @@ def process_llm_output(raw: str) -> dict:
     return data
 
 # ------------------------------------------------------------
-# Per‑chat history and Telegram handler
+# 10. Conversation history per chat
 # ------------------------------------------------------------
 history_store = {}
 
-async def handle_message(update, context):
-    chat_id = update.effective_chat.id
-    user_text = update.message.text
-    log(f"MSG from {chat_id}: {user_text}")
-
+def process_message(chat_id, user_text):
     if chat_id not in history_store:
         history_store[chat_id] = []
     history_store[chat_id].append({"role": "user", "content": user_text})
@@ -303,7 +308,7 @@ async def handle_message(update, context):
             "chat_id": chat_id,
             "question": user_text,
             "answer": final_json.get("answer"),
-            "raw_llm": raw,
+            "raw_llm": raw
         }))
     except Exception as e:
         reply_text = json.dumps({"answer": "internal error", "log_url": f"{BASE_URL}/run.jsonl"})
@@ -311,29 +316,52 @@ async def handle_message(update, context):
             "time": datetime.now(timezone.utc).isoformat(),
             "chat_id": chat_id,
             "error": str(e),
-            "traceback": traceback.format_exc(),
+            "traceback": traceback.format_exc()
         }))
         log(f"ERROR: {traceback.format_exc()}")
 
-    # Send reply (library first, raw HTTP fallback)
+    # Send reply via Telegram API
     try:
-        await context.bot.send_message(chat_id=chat_id, text=reply_text)
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": reply_text}
+        )
     except Exception as send_err:
-        log(f"sendMessage error: {send_err}, using raw HTTP")
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": reply_text}
-            )
-        except:
-            pass
+        log(f"sendMessage failed: {send_err}")
 
     history_store[chat_id].append({"role": "assistant", "content": reply_text})
     if len(history_store[chat_id]) > 20:
         history_store[chat_id] = history_store[chat_id][-20:]
 
 # ------------------------------------------------------------
-# FastAPI app (health fixed for HEAD requests too)
+# 11. Telegram long‑polling (raw HTTP, no third‑party lib)
+# ------------------------------------------------------------
+def telegram_polling():
+    offset = 0
+    log(">>> Telegram polling started")
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                params={"offset": offset, "timeout": 30},
+                timeout=35
+            )
+            if resp.status_code == 200:
+                updates = resp.json().get("result", [])
+                for upd in updates:
+                    offset = upd["update_id"] + 1
+                    msg = upd.get("message")
+                    if msg and "text" in msg:
+                        chat_id = msg["chat"]["id"]
+                        user_text = msg["text"]
+                        log(f"MSG from {chat_id}: {user_text}")
+                        process_message(chat_id, user_text)
+        except Exception as e:
+            log(f"Polling error: {e}")
+            time.sleep(5)
+
+# ------------------------------------------------------------
+# 12. FastAPI app (health + log)
 # ------------------------------------------------------------
 app = FastAPI()
 
@@ -341,13 +369,13 @@ app = FastAPI()
 def health():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
-@app.get("/run.jsonl")
+@app.api_route("/run.jsonl", methods=["GET", "HEAD"])
 def run_log():
     content = "\n".join(local_log_lines)
     return PlainTextResponse(content, media_type="text/plain")
 
 # ------------------------------------------------------------
-# Background threads (start at module level)
+# 13. Keep‑alive thread (internal self‑ping)
 # ------------------------------------------------------------
 def keep_alive():
     while True:
@@ -357,19 +385,11 @@ def keep_alive():
         except:
             pass
 
-def run_bot():
-    log(">>> Bot thread started, building application...")
-    try:
-        application = Application.builder().token(BOT_TOKEN).build()
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        log(">>> Application built, starting polling...")
-        application.run_polling(drop_pending_updates=False)
-        log(">>> Polling ended (should not happen)")
-    except Exception as e:
-        log(f"!!! Bot thread crashed: {e}\n{traceback.format_exc()}")
-
+# ------------------------------------------------------------
+# 14. Start all threads
+# ------------------------------------------------------------
 threading.Thread(target=keep_alive, daemon=True).start()
-threading.Thread(target=run_bot, daemon=False).start()
+threading.Thread(target=telegram_polling, daemon=False).start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
