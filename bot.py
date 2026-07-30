@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Data-Analyst Telegram Bot – FREE tier only.
-Primary: AiPipe → OpenRouter → Hugging Face.
-Answers every message with a single JSON object.
-Debug prints to stderr (visible in Render logs).
+Uses OpenRouter free models (with tool calling) + Hugging Face as fallback.
+Threads start automatically on import, works with `uvicorn bot:app`.
 """
 
 import os, sys, json, time, threading, traceback
@@ -18,24 +17,22 @@ from fastapi.responses import PlainTextResponse
 from telegram.ext import Application, MessageHandler, filters
 
 # ------------------------------------------------------------
-# Configuration
+# Configuration (all from environment)
 # ------------------------------------------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-BASE_URL = os.environ["BASE_URL"]
+BASE_URL = os.environ["BASE_URL"]                    # your Render URL
 
-AIPIPE_API_KEY = os.environ.get("AIPIPE_API_KEY", "")
-AIPIPE_BASE_URL = os.environ.get("AIPIPE_BASE_URL", "https://api.aipipe.ai/v1")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 HF_API_KEY = os.environ.get("HF_API_KEY", "")
 
 # ------------------------------------------------------------
-# Logging to stderr (visible in Render)
+# Logging to stderr – visible in Render logs
 # ------------------------------------------------------------
 def log(msg: str):
     print(msg, file=sys.stderr, flush=True)
 
 # ------------------------------------------------------------
-# Global log list (served as JSONL)
+# Global JSONL log (served at /run.jsonl)
 # ------------------------------------------------------------
 log_lines = []
 
@@ -76,39 +73,47 @@ SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code, so 
 - If unsure, still answer as best you can. Output ONLY the JSON."""
 
 # ------------------------------------------------------------
-# LLM call helpers
+# Free LLM providers
 # ------------------------------------------------------------
-def call_openai_compatible(base_url, api_key, model, messages, tools=None):
-    url = f"{base_url}/chat/completions"
+def call_openrouter(model, messages, tools=None):
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
     payload = {"model": model, "messages": messages, "temperature": 0}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
     try:
-        resp = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                             json=payload, timeout=180)
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
         if resp.status_code == 200:
             data = resp.json()
             msg = data["choices"][0].get("message", {})
             if tools and msg.get("tool_calls"):
-                return json.dumps({"message": msg})
+                return json.dumps({"message": msg})   # signal: tool call
             return msg.get("content", "")
     except Exception as e:
-        log(f"OpenAI compat error: {e}")
+        log(f"OpenRouter error: {e}")
     return None
 
 def call_huggingface(model, messages):
     if not HF_API_KEY:
         return None
-    prompt = "\n".join(f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}"
-                       for m in messages if m['role'] != 'system')
+    prompt = "\n".join(
+        f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}"
+        for m in messages if m['role'] != 'system'
+    )
     if messages and messages[0]['role'] == 'system':
         prompt = f"System: {messages[0]['content']}\n{prompt}"
     try:
-        resp = requests.post(f"https://api-inference.huggingface.co/models/{model}",
-                             headers={"Authorization": f"Bearer {HF_API_KEY}"},
-                             json={"inputs": prompt, "parameters": {"max_new_tokens": 1024, "temperature": 0.0, "return_full_text": False}},
-                             timeout=180)
+        resp = requests.post(
+            f"https://api-inference.huggingface.co/models/{model}",
+            headers={"Authorization": f"Bearer {HF_API_KEY}"},
+            json={"inputs": prompt, "parameters": {
+                "max_new_tokens": 1024, "temperature": 0.0, "return_full_text": False
+            }},
+            timeout=180)
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, list) and data:
@@ -116,29 +121,21 @@ def call_huggingface(model, messages):
             elif isinstance(data, dict):
                 return data.get("generated_text", "")
     except Exception as e:
-        log(f"HF error: {e}")
+        log(f"HuggingFace error: {e}")
     return None
 
-# ------------------------------------------------------------
-# Unified LLM caller
-# ------------------------------------------------------------
 def call_llm(messages, tools=None):
     use_tools = tools is not None
-    # AiPipe
-    if AIPIPE_API_KEY:
-        for model in ["aipipe-v1"]:
-            res = call_openai_compatible(AIPIPE_BASE_URL, AIPIPE_API_KEY, model, messages, tools if use_tools else None)
-            if res is not None:
-                return res
-    # OpenRouter
     if OPENROUTER_API_KEY:
-        for model in ["meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-001",
-                      "mistralai/mistral-7b-instruct:free", "nousresearch/hermes-3-llama-3.1-405b:free"]:
-            res = call_openai_compatible("https://openrouter.ai/api/v1", OPENROUTER_API_KEY, model, messages,
-                                         tools if use_tools else None)
+        for model in [
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "google/gemini-2.0-flash-001",
+            "mistralai/mistral-7b-instruct:free",
+            "nousresearch/hermes-3-llama-3.1-405b:free"
+        ]:
+            res = call_openrouter(model, messages, tools if use_tools else None)
             if res is not None:
                 return res
-    # Hugging Face (only if no tools)
     if not use_tools:
         for model in ["mistralai/Mistral-7B-Instruct-v0.3", "HuggingFaceH4/zephyr-7b-beta"]:
             res = call_huggingface(model, messages)
@@ -151,9 +148,20 @@ def call_llm(messages, tools=None):
 # ------------------------------------------------------------
 def agent_loop(history):
     deadline = time.time() + 210
-    max_calls = 10
+    max_tool_calls = 10
     done = 0
-    tools = [{"type": "function", "function": {"name": "run_python", "description": "Run Python code", "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}}}]
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": "Run Python code to fetch/compute.",
+            "parameters": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"]
+            }
+        }
+    }]
     messages = [{"role": "system", "content": SYSTEM_PROMPT_TOOLS}] + history
 
     while True:
@@ -161,16 +169,19 @@ def agent_loop(history):
             messages[0] = {"role": "system", "content": SYSTEM_PROMPT_NO_TOOLS}
             raw = call_llm(messages, None)
             return raw or '{"answer": "timeout error", "log_url": "LOG_URL_PLACEHOLDER"}'
+
         raw = call_llm(messages, tools)
         if raw is None:
             return '{"answer": "service unavailable", "log_url": "LOG_URL_PLACEHOLDER"}'
+
+        # Tool call handling
         if raw.startswith('{"message":'):
             try:
                 msg = json.loads(raw)["message"]
             except:
                 return raw
             if msg.get("tool_calls"):
-                if done >= max_calls:
+                if done >= max_tool_calls:
                     messages.append({"role": "user", "content": "Stop tools. Answer NOW."})
                     continue
                 tc = msg["tool_calls"][0]
@@ -192,7 +203,7 @@ def agent_loop(history):
         return raw
 
 # ------------------------------------------------------------
-# JSON extraction
+# JSON extraction & answer shaping
 # ------------------------------------------------------------
 def extract_json(text):
     start = text.find('{')
@@ -235,20 +246,33 @@ async def handle_message(update, context):
         raw = agent_loop(history_store[chat_id])
         final_json = process_llm_output(raw)
         reply_text = json.dumps(final_json)
-        log_lines.append({"time": datetime.now(timezone.utc).isoformat(), "chat_id": chat_id, "question": user_text, "answer": final_json.get("answer"), "raw_llm": raw})
+        log_lines.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "chat_id": chat_id,
+            "question": user_text,
+            "answer": final_json.get("answer"),
+            "raw_llm": raw
+        })
     except Exception as e:
         reply_text = json.dumps({"answer": "internal error", "log_url": f"{BASE_URL}/run.jsonl"})
-        log_lines.append({"time": datetime.now(timezone.utc).isoformat(), "chat_id": chat_id, "error": str(e), "traceback": traceback.format_exc()})
+        log_lines.append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "chat_id": chat_id,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        })
         log(f"ERROR: {traceback.format_exc()}")
 
-    # Send reply (first via PTB, then raw HTTP fallback)
+    # Send reply – first via library, then raw HTTP fallback
     try:
         await context.bot.send_message(chat_id=chat_id, text=reply_text)
     except Exception as send_err:
         log(f"sendMessage error: {send_err}, using raw HTTP")
         try:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          json={"chat_id": chat_id, "text": reply_text})
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": reply_text}
+            )
         except:
             pass
 
@@ -270,7 +294,7 @@ def run_log():
     return PlainTextResponse("\n".join(json.dumps(line) for line in log_lines), media_type="text/plain")
 
 # ------------------------------------------------------------
-# Keep-alive thread
+# Background threads (start immediately on import)
 # ------------------------------------------------------------
 def keep_alive():
     while True:
@@ -280,27 +304,23 @@ def keep_alive():
         except:
             pass
 
-# ------------------------------------------------------------
-# Bot thread with robust error logging
-# ------------------------------------------------------------
 def run_bot():
     log(">>> Bot thread started, building application...")
     try:
         application = Application.builder().token(BOT_TOKEN).build()
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         log(">>> Application built, starting polling...")
-        application.run_polling(drop_pending_updates=False)   # consume all queued messages
+        application.run_polling(drop_pending_updates=False)
         log(">>> Polling ended (should not happen)")
     except Exception as e:
         log(f"!!! Bot thread crashed: {e}\n{traceback.format_exc()}")
 
+# Start threads (no `if __name__` guard – this is essential for uvicorn import)
+threading.Thread(target=keep_alive, daemon=True).start()
+threading.Thread(target=run_bot, daemon=False).start()
+
 # ------------------------------------------------------------
-# Main
+# Local run (only if executed directly, not via uvicorn)
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    # Start keep-alive and bot threads (non-daemon so they stay alive)
-    t1 = threading.Thread(target=keep_alive, daemon=True)
-    t2 = threading.Thread(target=run_bot, daemon=False)   # non-daemon prevents premature exit
-    t1.start()
-    t2.start()
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
