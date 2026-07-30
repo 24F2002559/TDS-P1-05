@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Data-Analyst Telegram Bot – RAW HTTP polling (no async/event-loop).
-Free multi‑provider LLM chain: AiPipe → Gemini → Groq → Together → OpenRouter → HuggingFace.
-Answers every message with a single JSON object.
+Data-Analyst Telegram Bot – RAW HTTP polling.
+Free multi‑provider LLM: AiPipe → Gemini → Groq → Together → OpenRouter → HuggingFace.
 """
 
 import os, sys, json, time, threading, base64, traceback
@@ -16,32 +15,30 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
 # ------------------------------------------------------------
-# 1. Configuration (all from environment)
+# 1. Configuration
 # ------------------------------------------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-BASE_URL = os.environ["BASE_URL"]                        # your Render URL
+BASE_URL = os.environ["BASE_URL"]
 
-# --- LLM API keys (all free – set the ones you have) ---
-AIPIPE_API_KEY = os.environ.get("AIPIPE_API_KEY", "")    # aipipe.ai
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")    # aistudio.google.com
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")        # console.groq.com/keys
-TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")# together.ai/settings/api-keys
+AIPIPE_API_KEY = os.environ.get("AIPIPE_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 HF_API_KEY = os.environ.get("HF_API_KEY", "")
 
-# --- GitHub logging (optional) ---
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "run.jsonl")
 
 # ------------------------------------------------------------
-# 2. Logging helper (stderr → Render logs)
+# 2. Logging helper
 # ------------------------------------------------------------
 def log(msg: str):
     print(msg, file=sys.stderr, flush=True)
 
 # ------------------------------------------------------------
-# 3. Global log list (local backup) + GitHub sync
+# 3. Global log + GitHub sync
 # ------------------------------------------------------------
 local_log_lines = []
 
@@ -125,10 +122,12 @@ def call_openai_compatible(base_url, api_key, model, messages, tools=None):
             data = resp.json()
             msg = data["choices"][0].get("message", {})
             if tools and msg.get("tool_calls"):
-                return json.dumps({"message": msg})   # tool call signal
+                return json.dumps({"message": msg})
             return msg.get("content", "")
+        else:
+            log(f"  -> {model} returned {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        log(f"OpenAI compat error ({model}): {e}")
+        log(f"  -> {model} error: {e}")
     return None
 
 def call_huggingface(model, messages):
@@ -151,7 +150,7 @@ def call_huggingface(model, messages):
             elif isinstance(data, dict):
                 return data.get("generated_text", "")
     except Exception as e:
-        log(f"HF error: {e}")
+        log(f"  -> HF {model} error: {e}")
     return None
 
 # ------------------------------------------------------------
@@ -159,53 +158,91 @@ def call_huggingface(model, messages):
 # ------------------------------------------------------------
 def call_llm(messages, tools=None):
     use_tools = tools is not None
+    log("Trying LLM providers...")
 
-    # 0. AiPipe
+    # 0. AiPipe – corrected base URL
     if AIPIPE_API_KEY:
-        for model in ["aipipe-v1"]:
-            res = call_openai_compatible("https://api.aipipe.ai/v1", AIPIPE_API_KEY, model, messages, tools if use_tools else None)
+        log("  [0] AiPipe")
+        for model in ["aipipe-v1"]:   # or whatever model name your account uses
+            res = call_openai_compatible(
+                "https://aipipe.org/openai/v1",   # ← FIXED BASE URL
+                AIPIPE_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
             if res is not None:
                 return res
 
-    # 1. Gemini (Google AI Studio)
+    # 1. Gemini
     if GEMINI_API_KEY:
+        log("  [1] Gemini")
         for model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
-            res = call_openai_compatible("https://generativelanguage.googleapis.com/v1beta/openai", GEMINI_API_KEY, model, messages, tools if use_tools else None)
+            res = call_openai_compatible(
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                GEMINI_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
             if res is not None:
                 return res
 
     # 2. Groq
     if GROQ_API_KEY:
+        log("  [2] Groq")
         for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-            res = call_openai_compatible("https://api.groq.com/openai/v1", GROQ_API_KEY, model, messages, tools if use_tools else None)
+            res = call_openai_compatible(
+                "https://api.groq.com/openai/v1",
+                GROQ_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
             if res is not None:
                 return res
 
     # 3. Together AI
     if TOGETHER_API_KEY:
+        log("  [3] Together AI")
         for model in ["meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"]:
-            res = call_openai_compatible("https://api.together.xyz/v1", TOGETHER_API_KEY, model, messages, tools if use_tools else None)
+            res = call_openai_compatible(
+                "https://api.together.xyz/v1",
+                TOGETHER_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
             if res is not None:
                 return res
 
     # 4. OpenRouter
     if OPENROUTER_API_KEY:
+        log("  [4] OpenRouter")
         for model in ["meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-001"]:
-            res = call_openai_compatible("https://openrouter.ai/api/v1", OPENROUTER_API_KEY, model, messages, tools if use_tools else None)
+            res = call_openai_compatible(
+                "https://openrouter.ai/api/v1",
+                OPENROUTER_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
             if res is not None:
                 return res
 
-    # 5. Hugging Face (text‑only, no tools)
-    if not use_tools:
+    # 5. Hugging Face (text only)
+    if not use_tools and HF_API_KEY:
+        log("  [5] Hugging Face")
         for model in ["mistralai/Mistral-7B-Instruct-v0.3"]:
             res = call_huggingface(model, messages)
             if res is not None:
                 return res
 
+    log("  All providers failed.")
     return None
 
 # ------------------------------------------------------------
-# 8. Agent loop (LLM + tool execution)
+# 8. Agent loop
 # ------------------------------------------------------------
 def agent_loop(history):
     deadline = time.time() + 210
@@ -320,7 +357,7 @@ def process_message(chat_id, user_text):
         }))
         log(f"ERROR: {traceback.format_exc()}")
 
-    # Send reply via Telegram API
+    # Send reply via raw Telegram API
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -334,7 +371,7 @@ def process_message(chat_id, user_text):
         history_store[chat_id] = history_store[chat_id][-20:]
 
 # ------------------------------------------------------------
-# 11. Telegram long‑polling (raw HTTP, no third‑party lib)
+# 11. Telegram long‑polling
 # ------------------------------------------------------------
 def telegram_polling():
     offset = 0
@@ -361,7 +398,7 @@ def telegram_polling():
             time.sleep(5)
 
 # ------------------------------------------------------------
-# 12. FastAPI app (health + log)
+# 12. FastAPI app
 # ------------------------------------------------------------
 app = FastAPI()
 
@@ -375,7 +412,7 @@ def run_log():
     return PlainTextResponse(content, media_type="text/plain")
 
 # ------------------------------------------------------------
-# 13. Keep‑alive thread (internal self‑ping)
+# 13. Keep‑alive
 # ------------------------------------------------------------
 def keep_alive():
     while True:
@@ -386,7 +423,7 @@ def keep_alive():
             pass
 
 # ------------------------------------------------------------
-# 14. Start all threads
+# 14. Start threads
 # ------------------------------------------------------------
 threading.Thread(target=keep_alive, daemon=True).start()
 threading.Thread(target=telegram_polling, daemon=False).start()
