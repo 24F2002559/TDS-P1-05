@@ -5,7 +5,7 @@ Free providers: AiPipe (GPTs), OpenRouter (free models), Hugging Face.
 Gemini temporarily skipped (quota exceeded). Groq/Together optional.
 """
 
-import os, sys, json, time, threading, base64, traceback
+import os, sys, json, time, threading, base64, traceback, re
 from io import StringIO
 from datetime import datetime, timezone
 from typing import Optional
@@ -94,14 +94,13 @@ def run_python(code: str) -> str:
     return mystdout.getvalue()[-8000:]
 
 # ------------------------------------------------------------
-# 5. System prompts – KEY CHANGE
+# 5. System prompts – hardened against error objects
 # ------------------------------------------------------------
 SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON object. Use `run_python` to fetch/compute.
 - Answer the LAST user message; earlier ones are context.
-- Include "log_url": "LOG_URL_PLACEHOLDER".
-- If a message is only setup, reply {"answer": "ack", "log_url": "LOG_URL_PLACEHOLDER"}.
-- The final output must be a single valid JSON object matching exactly the shape requested by the user. 
-- If the Python tool fails to fetch data (e.g., network error, invalid URL), DO NOT output an error object. Instead, use your own knowledge to provide the best possible answer in the exact requested JSON shape.
+- Your final output must be a single JSON object with exactly two keys: "answer" and "log_url".
+- The value of "answer" must EXACTLY match the shape requested by the user. For example, if the user asks for {"state": "<state name>"}, your output must be {"answer": {"state": "Assam"}, "log_url": "LOG_URL_PLACEHOLDER"}.
+- If any tool call fails for any reason (parse error, network error, missing data, etc.), STOP using tools immediately and use your own internal knowledge to provide the best possible answer in the exact requested shape. Never output an error object, error message, or "error" key.
 - Never output markdown, prose, or extra text. Only the JSON."""
 
 SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code. Give your best answer from your knowledge.
@@ -111,7 +110,19 @@ SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code. Giv
 - Output ONLY the JSON."""
 
 # ------------------------------------------------------------
-# 6. Multi‑provider LLM helpers
+# 6. Helper to fix malformed JSON (control characters)
+# ------------------------------------------------------------
+def safe_json_loads(s: str):
+    """Try to parse JSON, if fails, escape control characters and retry."""
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError as e:
+        # replace literal newline, carriage return, tab with escaped versions
+        fixed = s.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        return json.loads(fixed)
+
+# ------------------------------------------------------------
+# 7. Multi‑provider LLM helpers
 # ------------------------------------------------------------
 def call_openai_compatible(base_url, api_key, model, messages, tools=None):
     url = f"{base_url}/chat/completions"
@@ -158,7 +169,7 @@ def call_huggingface(model, messages):
     return None
 
 # ------------------------------------------------------------
-# 7. Unified LLM caller (AiPipe → OpenRouter → HF)
+# 8. Unified LLM caller (AiPipe → OpenRouter → HF)
 # ------------------------------------------------------------
 def call_llm(messages, tools=None):
     use_tools = tools is not None
@@ -212,7 +223,7 @@ def call_llm(messages, tools=None):
     return None
 
 # ------------------------------------------------------------
-# 8. Agent loop (safe tool‑call parsing)
+# 9. Agent loop (with robust argument parsing)
 # ------------------------------------------------------------
 def agent_loop(history):
     deadline = time.time() + 210
@@ -257,12 +268,14 @@ def agent_loop(history):
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "Unknown function"})
                     continue
 
+                # ----- ROBUST ARGUMENT PARSING -----
                 try:
-                    args = json.loads(tc["function"]["arguments"])
+                    args = safe_json_loads(tc["function"]["arguments"])
                     code = args["code"]
                 except (json.JSONDecodeError, KeyError) as e:
-                    log(f"Tool arguments error: {e}")
-                    out = f"Error parsing arguments: {e}. Please provide valid JSON with escaped characters."
+                    log(f"Tool arguments error (after fix attempt): {e}")
+                    # Still broken – tell the model it failed and let it continue without tools
+                    out = f"Error parsing arguments: {e}. Please answer without using tools, based on your knowledge."
                     push_log_line(json.dumps({
                         "time": datetime.now(timezone.utc).isoformat(),
                         "type": "tool_parse_error",
@@ -272,6 +285,7 @@ def agent_loop(history):
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
                     done += 1
                     continue
+                # ------------------------------------
 
                 push_log_line(json.dumps({
                     "time": datetime.now(timezone.utc).isoformat(),
@@ -284,6 +298,9 @@ def agent_loop(history):
                     "type": "tool_output",
                     "output": out
                 }))
+                # If the tool output indicates a failure, append a note encouraging fallback
+                if out.startswith("Error:"):
+                    out += "\n[System: Tool failed. Use your own knowledge to answer in the requested JSON shape.]"
                 messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
                 done += 1
@@ -294,7 +311,7 @@ def agent_loop(history):
         return raw
 
 # ------------------------------------------------------------
-# 9. JSON extraction & answer shaping
+# 10. JSON extraction & answer shaping
 # ------------------------------------------------------------
 def extract_json(text):
     start = text.find('{')
@@ -320,7 +337,7 @@ def process_llm_output(raw):
     return data
 
 # ------------------------------------------------------------
-# 10. Conversation history per chat
+# 11. Conversation history per chat
 # ------------------------------------------------------------
 history_store = {}
 
@@ -364,7 +381,7 @@ def process_message(chat_id, user_text):
         history_store[chat_id] = history_store[chat_id][-20:]
 
 # ------------------------------------------------------------
-# 11. Telegram long‑polling
+# 12. Telegram long‑polling
 # ------------------------------------------------------------
 def telegram_polling():
     offset = 0
@@ -391,7 +408,7 @@ def telegram_polling():
             time.sleep(5)
 
 # ------------------------------------------------------------
-# 12. FastAPI app
+# 13. FastAPI app
 # ------------------------------------------------------------
 app = FastAPI()
 
@@ -405,7 +422,7 @@ def run_log():
     return PlainTextResponse(content, media_type="text/plain")
 
 # ------------------------------------------------------------
-# 13. Keep‑alive
+# 14. Keep‑alive
 # ------------------------------------------------------------
 def keep_alive():
     while True:
@@ -416,7 +433,7 @@ def keep_alive():
             pass
 
 # ------------------------------------------------------------
-# 14. Start threads
+# 15. Start threads
 # ------------------------------------------------------------
 threading.Thread(target=keep_alive, daemon=True).start()
 threading.Thread(target=telegram_polling, daemon=False).start()
