@@ -219,7 +219,7 @@ def call_llm(messages, tools=None):
     return None
 
 # ------------------------------------------------------------
-# 8. Agent loop
+# 8. Agent loop (with safe tool‑call argument parsing)
 # ------------------------------------------------------------
 def agent_loop(history):
     deadline = time.time() + 210
@@ -263,10 +263,36 @@ def agent_loop(history):
                     messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "Unknown function"})
                     continue
-                code = json.loads(tc["function"]["arguments"])["code"]
-                push_log_line(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "type": "tool_call", "code": code}))
+
+                # ----- SAFE ARGUMENT PARSING -----
+                try:
+                    args = json.loads(tc["function"]["arguments"])
+                    code = args["code"]
+                except (json.JSONDecodeError, KeyError) as e:
+                    log(f"Tool arguments error: {e}")
+                    out = f"Error parsing arguments: {e}. Please provide valid JSON with escaped characters."
+                    push_log_line(json.dumps({
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "type": "tool_parse_error",
+                        "error": str(e)
+                    }))
+                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
+                    done += 1
+                    continue
+                # ----------------------------------
+
+                push_log_line(json.dumps({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "type": "tool_call",
+                    "code": code
+                }))
                 out = run_python(code)
-                push_log_line(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "type": "tool_output", "output": out}))
+                push_log_line(json.dumps({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "type": "tool_output",
+                    "output": out
+                }))
                 messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
                 done += 1
