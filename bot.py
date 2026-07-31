@@ -94,17 +94,20 @@ def run_python(code: str) -> str:
     return mystdout.getvalue()[-8000:]
 
 # ------------------------------------------------------------
-# 5. System prompts
+# 5. System prompts – KEY CHANGE
 # ------------------------------------------------------------
 SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON object. Use `run_python` to fetch/compute.
 - Answer the LAST user message; earlier ones are context.
 - Include "log_url": "LOG_URL_PLACEHOLDER".
 - If a message is only setup, reply {"answer": "ack", "log_url": "LOG_URL_PLACEHOLDER"}.
-- Output ONLY the JSON, no markdown, no prose."""
+- The final output must be a single valid JSON object matching exactly the shape requested by the user. 
+- If the Python tool fails to fetch data (e.g., network error, invalid URL), DO NOT output an error object. Instead, use your own knowledge to provide the best possible answer in the exact requested JSON shape.
+- Never output markdown, prose, or extra text. Only the JSON."""
 
 SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code. Give your best answer from your knowledge.
 - Reply ONLY with a JSON object matching the last user request.
 - Include "log_url": "LOG_URL_PLACEHOLDER".
+- The answer must be in the exact JSON shape requested. Never output an error object.
 - Output ONLY the JSON."""
 
 # ------------------------------------------------------------
@@ -155,13 +158,12 @@ def call_huggingface(model, messages):
     return None
 
 # ------------------------------------------------------------
-# 7. Unified LLM caller (AiPipe → OpenRouter → HF → optional Groq/Together)
+# 7. Unified LLM caller (AiPipe → OpenRouter → HF)
 # ------------------------------------------------------------
 def call_llm(messages, tools=None):
     use_tools = tools is not None
     log("Trying LLM providers...")
 
-    # ---- 0. AiPipe (free GPT models – cheap & reliable) ----
     if AIPIPE_API_KEY:
         log("  [0] AiPipe")
         for model in [
@@ -181,12 +183,8 @@ def call_llm(messages, tools=None):
             if res is not None:
                 return res
 
-    # ---- (Gemini skipped – quota exceeded) ----
-    # if GEMINI_API_KEY: ...
-
-    # ---- 4. OpenRouter (real free models) ----
     if OPENROUTER_API_KEY:
-        log("  [4] OpenRouter")
+        log("  [1] OpenRouter")
         for model in [
             "meta-llama/llama-3.2-3b-instruct:free",
             "mistralai/mistral-7b-instruct:free",
@@ -203,23 +201,18 @@ def call_llm(messages, tools=None):
             if res is not None:
                 return res
 
-    # ---- 5. Hugging Face (text only, no tools) ----
     if not use_tools and HF_API_KEY:
-        log("  [5] Hugging Face")
+        log("  [2] Hugging Face")
         for model in ["mistralai/Mistral-7B-Instruct-v0.3"]:
             res = call_huggingface(model, messages)
             if res is not None:
                 return res
 
-    # Optional: Groq and Together if keys are set (uncomment if you have them)
-    # if GROQ_API_KEY: ...
-    # if TOGETHER_API_KEY: ...
-
     log("  All providers failed.")
     return None
 
 # ------------------------------------------------------------
-# 8. Agent loop (with safe tool‑call argument parsing)
+# 8. Agent loop (safe tool‑call parsing)
 # ------------------------------------------------------------
 def agent_loop(history):
     deadline = time.time() + 210
@@ -264,7 +257,6 @@ def agent_loop(history):
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "Unknown function"})
                     continue
 
-                # ----- SAFE ARGUMENT PARSING -----
                 try:
                     args = json.loads(tc["function"]["arguments"])
                     code = args["code"]
@@ -280,7 +272,6 @@ def agent_loop(history):
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
                     done += 1
                     continue
-                # ----------------------------------
 
                 push_log_line(json.dumps({
                     "time": datetime.now(timezone.utc).isoformat(),
@@ -360,7 +351,6 @@ def process_message(chat_id, user_text):
         }))
         log(f"ERROR: {traceback.format_exc()}")
 
-    # Send reply via raw Telegram API
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
