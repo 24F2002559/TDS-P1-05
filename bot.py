@@ -1,32 +1,43 @@
 #!/usr/bin/env python3
 """
-Data-analyst Telegram bot – TDS Project 1 (fully merged, all free providers).
+Data-Analyst Telegram Bot – production version (all free providers).
 
-- Concurrency (thread pool), Python sandbox timeout, persistent file logging.
+- In‑memory logging served as plain text + GitHub sync.
 - Multi‑provider fallback: AiPipe → Groq → Together → OpenRouter → HuggingFace.
-- Optional GitHub log sync. /run.jsonl served as plain text.
+- Thread pool for concurrent TA testing.
+- Python sandbox timeout (60 s), 300 s answer budget, LLM retries.
 - Robust JSON extraction & safe argument parsing.
 """
 
-import base64, io, json, os, re, threading, time, traceback, contextlib
+import base64
+import json
+import os
+import re
+import sys               # ← FIX: missing import caused NameError
+import threading
+import time
+import traceback
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from io import StringIO
 from typing import Optional
 
-import requests, uvicorn
+import requests
+import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 1. Configuration
+# ------------------------------------------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL = os.environ["BASE_URL"]
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 AIPIPE_API_KEY = os.environ.get("AIPIPE_API_KEY", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")          # new
+TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")  # new
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 HF_API_KEY = os.environ.get("HF_API_KEY", "")
 
@@ -34,25 +45,27 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "run.jsonl")
 
-LOG_PATH = "/tmp/run.jsonl"
 LOG_URL = f"{BASE_URL}/run.jsonl"
 
 MAX_AGENT_STEPS = 10
-PY_TIMEOUT = 60          # seconds per run_python call
-ANSWER_BUDGET = 300      # total seconds per question
+PY_TIMEOUT = 60             # seconds per run_python call
+ANSWER_BUDGET = 300         # total seconds per question (5 min)
 
-# ---------------------------------------------------------------------------
-# Logging (stderr + file + optional GitHub)
-# ---------------------------------------------------------------------------
-_log_lock = threading.Lock()
-
+# ------------------------------------------------------------
+# 2. Logging helper (stderr)
+# ------------------------------------------------------------
 def log(msg: str):
     print(msg, file=sys.stderr, flush=True)
 
+# ------------------------------------------------------------
+# 3. In‑memory log + GitHub sync (non‑blocking)
+# ------------------------------------------------------------
+local_log_lines = []
+
 def push_log_line(line: str):
-    with _log_lock:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+    """Append to in‑memory list and push to GitHub in a background thread."""
+    local_log_lines.append(line)
+    # GitHub sync
     if GITHUB_TOKEN and GITHUB_REPO:
         threading.Thread(target=_push_to_github, args=(line,), daemon=True).start()
 
@@ -75,14 +88,15 @@ def _push_to_github(json_line: str):
         if sha:
             payload["sha"] = sha
         requests.put(url, headers=headers, json=payload)
-    except Exception:
+    except Exception as e:
+        # Silently ignore GitHub push failures – the endpoint still works.
         pass
 
-# ---------------------------------------------------------------------------
-# Sandbox with timeout
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 4. Safe Python sandbox WITH TIMEOUT
+# ------------------------------------------------------------
 def run_python(code: str) -> str:
-    out = io.StringIO()
+    out = StringIO()
     result = {}
 
     def target():
@@ -110,9 +124,9 @@ def run_python(code: str) -> str:
     text = out.getvalue()
     return text[-8000:] if text else "(no output — use print())"
 
-# ---------------------------------------------------------------------------
-# Prompts (yours)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 5. System prompts (your exact wording)
+# ------------------------------------------------------------
 SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON object. Use `run_python` to fetch/compute.
 - Answer the LAST user message; earlier ones are context.
 - Your final output must be a single JSON object with exactly two keys: "answer" and "log_url".
@@ -126,9 +140,9 @@ SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code. Giv
 - The answer must be in the exact JSON shape requested. Never output an error object.
 - Output ONLY the JSON."""
 
-# ---------------------------------------------------------------------------
-# Safe JSON loader
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 6. Safe JSON loader (fixes control characters)
+# ------------------------------------------------------------
 def safe_json_loads(s: str):
     try:
         return json.loads(s)
@@ -136,9 +150,9 @@ def safe_json_loads(s: str):
         fixed = s.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
         return json.loads(fixed)
 
-# ---------------------------------------------------------------------------
-# LLM helpers
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 7. LLM helpers – all providers
+# ------------------------------------------------------------
 def call_openai_compatible(base_url, api_key, model, messages, tools=None):
     url = f"{base_url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -183,9 +197,9 @@ def call_huggingface(model, messages):
         log(f"  -> HF {model} error: {e}")
     return None
 
-# ---------------------------------------------------------------------------
-# Unified LLM caller (all free providers, retry once)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 8. Unified LLM caller with RETRY
+# ------------------------------------------------------------
 def call_llm(messages, tools=None, retry=True):
     use_tools = tools is not None
     log("Trying LLM providers...")
@@ -198,7 +212,7 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # 2. Groq
+    # 2. Groq (free)
     if GROQ_API_KEY:
         log("  [Groq]")
         for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]:
@@ -206,7 +220,7 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # 3. Together AI
+    # 3. Together AI (free)
     if TOGETHER_API_KEY:
         log("  [Together]")
         for model in ["meta-llama/Llama-3.3-70B-Instruct-Turbo-Free", "mistralai/Mistral-7B-Instruct-v0.1"]:
@@ -214,14 +228,13 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # 4. OpenRouter (updated free models that work)
+    # 4. OpenRouter (free tier – updated model list)
     if OPENROUTER_API_KEY:
         log("  [OpenRouter]")
         for model in [
-            "meta-llama/llama-3.2-3b-instruct:free",   # still working?
-            # The previously working ones are returning 404, so we include a known free list:
-            "google/gemini-2.0-flash-001",            # often free
-            "mistralai/mistral-7b-instruct:free",     # sometimes free
+            "meta-llama/llama-3.2-3b-instruct:free",
+            "google/gemini-2.0-flash-001",          # still free on OpenRouter
+            "mistralai/mistral-7b-instruct:free",
             "nousresearch/hermes-3-llama-3.1-405b:free",
         ]:
             res = call_openai_compatible("https://openrouter.ai/api/v1", OPENROUTER_API_KEY, model, messages, tools if use_tools else None)
@@ -236,7 +249,7 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # Retry once
+    # Retry once after a short delay
     if retry:
         log("  All providers failed. Retrying once after 2s...")
         time.sleep(2)
@@ -245,9 +258,9 @@ def call_llm(messages, tools=None, retry=True):
     log("  All providers failed after retry.")
     return None
 
-# ---------------------------------------------------------------------------
-# Agent loop
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 9. Agent loop (your logic, but with 300 s budget)
+# ------------------------------------------------------------
 def agent_loop(history):
     deadline = time.time() + ANSWER_BUDGET
     done = 0
@@ -290,22 +303,34 @@ def agent_loop(history):
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "Unknown function"})
                     continue
 
-                # Parse arguments safely
+                # Robust argument parsing
                 try:
                     args = safe_json_loads(tc["function"]["arguments"])
                     code = args["code"]
                 except (json.JSONDecodeError, KeyError) as e:
                     log(f"Tool arguments error: {e}")
                     out = f"Error parsing arguments: {e}. Please answer without using tools."
-                    push_log_line(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "type": "tool_parse_error", "error": str(e)}))
+                    push_log_line(json.dumps({
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "type": "tool_parse_error",
+                        "error": str(e)
+                    }))
                     messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
                     done += 1
                     continue
 
-                push_log_line(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "type": "tool_call", "code": code}))
+                push_log_line(json.dumps({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "type": "tool_call",
+                    "code": code
+                }))
                 out = run_python(code)
-                push_log_line(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "type": "tool_output", "output": out}))
+                push_log_line(json.dumps({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "type": "tool_output",
+                    "output": out
+                }))
                 if out.startswith("Error:"):
                     out += "\n[System: Tool failed. Use your own knowledge to answer in the requested JSON shape.]"
                 messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
@@ -317,15 +342,18 @@ def agent_loop(history):
                 return raw
         return raw
 
-# ---------------------------------------------------------------------------
-# JSON extraction (handles fences & strings)
-# ---------------------------------------------------------------------------
-def extract_json(text: str) -> Optional[dict]:
+# ------------------------------------------------------------
+# 10. JSON extraction & answer shaping
+# ------------------------------------------------------------
+def extract_json(text):
+    # Strip markdown fences if present
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
-    start = text.find("{")
+    start = text.find('{')
     if start == -1:
         return None
-    depth, in_str, esc = 0, False, False
+    depth = 0
+    in_str = False
+    esc = False
     for i in range(start, len(text)):
         c = text[i]
         if esc:
@@ -339,13 +367,13 @@ def extract_json(text: str) -> Optional[dict]:
             continue
         if in_str:
             continue
-        if c == "{":
+        if c == '{':
             depth += 1
-        elif c == "}":
+        elif c == '}':
             depth -= 1
             if depth == 0:
                 try:
-                    return json.loads(text[start : i + 1])
+                    return json.loads(text[start:i+1])
                 except json.JSONDecodeError:
                     return None
     return None
@@ -360,9 +388,9 @@ def process_llm_output(raw):
     data["log_url"] = LOG_URL
     return data
 
-# ---------------------------------------------------------------------------
-# Chat history & message processing (thread safe)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 11. Conversation history (thread‑safe, for multi‑turn)
+# ------------------------------------------------------------
 history_store = {}
 _hist_lock = threading.Lock()
 
@@ -377,6 +405,7 @@ def process_message(chat_id, user_text):
         raw = agent_loop(history)
         final_json = process_llm_output(raw)
         reply_text = json.dumps(final_json)
+
         push_log_line(json.dumps({
             "time": datetime.now(timezone.utc).isoformat(),
             "chat_id": chat_id,
@@ -394,6 +423,7 @@ def process_message(chat_id, user_text):
         }))
         log(f"ERROR: {traceback.format_exc()}")
 
+    # Send reply
     try:
         requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": reply_text})
     except Exception as send_err:
@@ -404,16 +434,20 @@ def process_message(chat_id, user_text):
         if len(history_store[chat_id]) > 20:
             history_store[chat_id] = history_store[chat_id][-20:]
 
-# ---------------------------------------------------------------------------
-# Telegram polling (thread pool for concurrency)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 12. Telegram polling (with THREAD POOL)
+# ------------------------------------------------------------
 def telegram_polling():
     offset = 0
     pool = ThreadPoolExecutor(max_workers=6)
     log(">>> Telegram polling started")
     while True:
         try:
-            resp = requests.get(f"{TG_API}/getUpdates", params={"offset": offset, "timeout": 50}, timeout=65)
+            resp = requests.get(
+                f"{TG_API}/getUpdates",
+                params={"offset": offset, "timeout": 50},
+                timeout=65
+            )
             if resp.status_code == 200:
                 for upd in resp.json().get("result", []):
                     offset = upd["update_id"] + 1
@@ -427,27 +461,24 @@ def telegram_polling():
             log(f"Polling error: {e}")
             time.sleep(5)
 
-# ---------------------------------------------------------------------------
-# FastAPI app – /run.jsonl as plain text
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 13. FastAPI app – inline run.jsonl (not a file download)
+# ------------------------------------------------------------
 app = FastAPI()
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
-@app.get("/run.jsonl")
+@app.api_route("/run.jsonl", methods=["GET", "HEAD"])
 def run_log():
-    # Serve the file content inline (not as download)
-    if os.path.exists(LOG_PATH):
-        with open(LOG_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
-        return PlainTextResponse(content, media_type="application/jsonl")
-    return PlainTextResponse("", media_type="application/jsonl")
+    """Return the accumulated log lines as plain text (displays inline)."""
+    content = "\n".join(local_log_lines)
+    return PlainTextResponse(content, media_type="text/plain")
 
-# ---------------------------------------------------------------------------
-# Keep‑alive & startup
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# 14. Keep‑alive & startup
+# ------------------------------------------------------------
 def keep_alive():
     while True:
         time.sleep(600)
@@ -456,7 +487,6 @@ def keep_alive():
         except:
             pass
 
-# Start threads
 threading.Thread(target=keep_alive, daemon=True).start()
 threading.Thread(target=telegram_polling, daemon=False).start()
 
