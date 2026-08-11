@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Data-Analyst Telegram Bot – AiPipe primary (OpenAI + OpenRouter proxy), free fallbacks.
+Data-Analyst Telegram Bot – AiPipe (skips on credit exhaustion) + free fallbacks.
 
-- Primary: AiPipe (OpenAI + OpenRouter proxy) for best accuracy.
-- Fallbacks (free): Groq → OpenRouter direct (incl. openrouter/free) → HuggingFace.
+- Primary: AiPipe (OpenAI + OpenRouter proxy) – skipped if credit exhausted (429).
+- Fallbacks (free): Groq → OpenRouter direct → HuggingFace.
 - Internet search via DuckDuckGo (DDGS from ddgs), Wikipedia, and generic HTTP fetches.
 - Thread pool, 60 s sandbox timeout, 300 s answer budget, persistent log + GitHub sync.
 - Robust JSON extraction and safe argument parsing.
@@ -46,7 +46,7 @@ GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "run.jsonl")
 
 LOG_URL = f"{BASE_URL}/run.jsonl"
 
-MAX_AGENT_STEPS = 5          # keep tight to avoid infinite loops
+MAX_AGENT_STEPS = 8          # enough for a couple of retries
 PY_TIMEOUT = 60              # seconds per run_python call
 ANSWER_BUDGET = 300          # total seconds per question (5 min)
 
@@ -129,20 +129,29 @@ def run_python(code: str) -> str:
     return text[-2000:] if text else "(no output — use print())"
 
 # ------------------------------------------------------------
-# 5. System prompt – explicit instructions for WHO / MOSPI / etc.
+# 5. System prompt – explicit, example‑driven instructions
 # ------------------------------------------------------------
 SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON object. Use `run_python` to fetch/compute.
 - Answer the LAST user message; earlier ones are context.
 - Your final output must be a single JSON object with exactly two keys: "answer" and "log_url".
 - The value of "answer" must EXACTLY match the shape requested by the user.
 
-**How to fetch data correctly:**
-- For WHO Global Health Observatory indicators (like WHOSIS_000001, life expectancy), use the official JSON API:
-  `https://ghoapi.azureedge.net/api/WHOSIS_000001`
-  This returns clean JSON. You can filter by country and year using pandas or direct Python.
-- For MOSPI data, search with `DDGS().text("MOSPI maternal mortality rate table", max_results=3)` and find a direct CSV/Excel file.
-- If a direct API fails, search the web with `DDGS().text()` for alternative mirrors or other reliable sources (e.g., Our World in Data, World Bank).
-- Use `wikipedia.page(title)` for quick factual summaries, but always prefer downloadable datasets for numeric computation.
+**How to fetch and process data correctly:**
+
+*For WHO Global Health Observatory indicators (e.g., WHOSIS_000001 – life expectancy):*
+- Use the official JSON API: `https://ghoapi.azureedge.net/api/WHOSIS_000001`
+- The response is a JSON object with a key `"value"` that is a list of records.
+- Each record has at least these fields:
+  - `"SpatialDimValue"`: 3‑letter country code (e.g., "BRA" for Brazil, "CHN" for China)
+  - `"TimeDim"`: year (integer)
+  - `"NumericValue"`: the life expectancy value (float)
+- You can filter with pandas: `df = pd.json_normalize(data['value'])`, then `df = df[df['SpatialDimValue'].isin(country_codes) & df['TimeDim'].isin([2010,2019,2021])]`.
+- Map country names to codes, e.g., `{"Brazil":"BRA","China":"CHN","India":"IND","Indonesia":"IDN","Mexico":"MEX","South Africa":"ZAF","Turkey":"TUR"}`.
+- Compute the gain (2019‑2010) and loss (2021‑2019) for each country, then the ratio = loss/gain, and find the country with the highest ratio.
+
+*For MOSPI data:* search with `DDGS().text("MOSPI maternal mortality rate table", max_results=3)` and find a direct CSV/Excel file.
+
+*If a direct API fails:* search the web with `DDGS().text()` for alternative mirrors or use `wikipedia.page(title)` for summaries, but always prefer downloadable datasets for numeric computation.
 
 **When parsing data:**
 - Always print the first 500 characters of the raw response to understand the format.
@@ -152,7 +161,7 @@ SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON obj
 - If one method fails, immediately try a completely different approach. Do NOT repeat the same broken request.
 
 **Important:**
-- You have up to 5 tool calls. Use them wisely.
+- You have up to 8 tool calls. Use them wisely.
 - If you cannot fetch the exact dataset after multiple attempts, you may use Wikipedia or your own knowledge, but only as a last resort. You must always provide a concrete answer – never an error object, "unknown", or "Data not available".
 - For simple arithmetic, answer directly without tools.
 - Never output markdown, prose, or extra text. Only the JSON."""
@@ -193,8 +202,8 @@ def call_openai_compatible(base_url, api_key, model, messages, tools=None):
             return msg.get("content", "")
         else:
             log(f"  -> {model} returned {resp.status_code}: {resp.text[:200]}")
-            # If 402 (payment required), signal caller to skip remaining models of this provider
-            if resp.status_code == 402:
+            # If 429 with "Usage", signal that provider is out of credits
+            if resp.status_code == 429 and "Usage" in resp.text:
                 return "SKIP_PROVIDER"
             return None
     except Exception as e:
@@ -225,21 +234,22 @@ def call_huggingface(model, messages):
     return None
 
 # ------------------------------------------------------------
-# 8. Unified LLM caller – AiPipe first (OpenAI + OpenRouter proxy), then free fallbacks
+# 8. Unified LLM caller – AiPipe first, then free fallbacks
 # ------------------------------------------------------------
 def call_llm(messages, tools=None, retry=True):
     use_tools = tools is not None
     log("Trying LLM providers...")
 
-    # ===== 1. AiPipe (primary – best accuracy) =====
+    # ===== 1. AiPipe (skip entirely if we previously got a credit‑exhausted signal) =====
     if AIPIPE_API_KEY:
         log("  [AiPipe]")
 
         # --- a) OpenAI models via aipipe.org/openai/v1 ---
+        skip_aipipe = False
         for model in [
-            "gpt-4",                 # strongest
-            "gpt-4o-mini",           # fast & good
-            "gpt-3.5-turbo",         # cheapest
+            "gpt-4",
+            "gpt-4o-mini",
+            "gpt-3.5-turbo",
         ]:
             res = call_openai_compatible(
                 "https://aipipe.org/openai/v1",
@@ -250,17 +260,17 @@ def call_llm(messages, tools=None, retry=True):
             )
             if res is not None:
                 if res == "SKIP_PROVIDER":
-                    log("  AiPipe OpenAI proxy returned 402 – skipping remaining OpenAI models.")
+                    log("  AiPipe OpenAI proxy credit exhausted – skipping remaining AiPipe models.")
+                    skip_aipipe = True
                     break
                 return res
 
         # --- b) OpenRouter models via aipipe.org/openrouter/v1 ---
-        # If the OpenAI proxy returned SKIP_PROVIDER, skip OpenRouter as well.
-        if res != "SKIP_PROVIDER":
+        if not skip_aipipe:
             for model in [
-                "openai/gpt-4.1-nano",        # very cheap, capable
-                "openai/gpt-4o-mini",         # same as above but via OpenRouter
-                "anthropic/claude-3-haiku",   # fast, cheap, accurate
+                "openai/gpt-4.1-nano",
+                "openai/gpt-4o-mini",
+                "anthropic/claude-3-haiku",
             ]:
                 res = call_openai_compatible(
                     "https://aipipe.org/openrouter/v1",
@@ -271,7 +281,7 @@ def call_llm(messages, tools=None, retry=True):
                 )
                 if res is not None:
                     if res == "SKIP_PROVIDER":
-                        log("  AiPipe OpenRouter proxy returned 402 – skipping remaining OpenRouter models.")
+                        log("  AiPipe OpenRouter proxy credit exhausted – skipping remaining OpenRouter models.")
                         break
                     return res
 
