@@ -5,3 +5,8 @@ pandas
 numpy
 beautifulsoup4
 openpyxl
+ddgs
+wikipedia
+lxml
+html5lib
+xlrd
