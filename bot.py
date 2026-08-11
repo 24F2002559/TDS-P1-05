@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Data-Analyst Telegram Bot – cheapest models first, internet‑enabled.
+Data-Analyst Telegram Bot – AiPipe primary (OpenAI + OpenRouter proxy), free fallbacks.
 
-- Primary: AiPipe (cheapest models: gpt-4.1-nano → gpt-4o-mini → claude-3-haiku)
-- Fallbacks (free): Groq → OpenRouter direct → HuggingFace
+- Primary: AiPipe (OpenAI + OpenRouter proxy) for best accuracy.
+- Fallbacks (free): Groq → OpenRouter direct (incl. openrouter/free) → HuggingFace.
 - Internet search via DuckDuckGo (DDGS from ddgs), Wikipedia, and generic HTTP fetches.
 - Thread pool, 60 s sandbox timeout, 300 s answer budget, persistent log + GitHub sync.
 - Robust JSON extraction and safe argument parsing.
@@ -46,7 +46,7 @@ GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "run.jsonl")
 
 LOG_URL = f"{BASE_URL}/run.jsonl"
 
-MAX_AGENT_STEPS = 5          # reduced to avoid wasting time on broken loops
+MAX_AGENT_STEPS = 5          # keep tight to avoid infinite loops
 PY_TIMEOUT = 60              # seconds per run_python call
 ANSWER_BUDGET = 300          # total seconds per question (5 min)
 
@@ -104,7 +104,7 @@ def run_python(code: str) -> str:
             "BeautifulSoup": __import__("bs4").BeautifulSoup,
             "openpyxl": __import__("openpyxl"),
             "json": __import__("json"),
-            # Updated DuckDuckGo import
+            # Internet search & Wikipedia
             "DDGS": __import__("ddgs").DDGS,
             "wikipedia": __import__("wikipedia"),
             # Additional parsing helpers
@@ -193,6 +193,7 @@ def call_openai_compatible(base_url, api_key, model, messages, tools=None):
             return msg.get("content", "")
         else:
             log(f"  -> {model} returned {resp.status_code}: {resp.text[:200]}")
+            # If 402 (payment required), signal caller to skip remaining models of this provider
             if resp.status_code == 402:
                 return "SKIP_PROVIDER"
             return None
@@ -224,22 +225,24 @@ def call_huggingface(model, messages):
     return None
 
 # ------------------------------------------------------------
-# 8. Unified LLM caller – cheapest first
+# 8. Unified LLM caller – AiPipe first (OpenAI + OpenRouter proxy), then free fallbacks
 # ------------------------------------------------------------
 def call_llm(messages, tools=None, retry=True):
     use_tools = tools is not None
     log("Trying LLM providers...")
 
-    # ===== 1. AiPipe (cheapest models first) =====
+    # ===== 1. AiPipe (primary – best accuracy) =====
     if AIPIPE_API_KEY:
         log("  [AiPipe]")
+
+        # --- a) OpenAI models via aipipe.org/openai/v1 ---
         for model in [
-            "openai/gpt-4.1-nano",
-            "openai/gpt-4o-mini",
-            "anthropic/claude-3-haiku",
+            "gpt-4",                 # strongest
+            "gpt-4o-mini",           # fast & good
+            "gpt-3.5-turbo",         # cheapest
         ]:
             res = call_openai_compatible(
-                "https://aipipe.org/openrouter/v1",
+                "https://aipipe.org/openai/v1",
                 AIPIPE_API_KEY,
                 model,
                 messages,
@@ -247,11 +250,32 @@ def call_llm(messages, tools=None, retry=True):
             )
             if res is not None:
                 if res == "SKIP_PROVIDER":
-                    log("  AiPipe returned 402 – skipping remaining AiPipe models.")
+                    log("  AiPipe OpenAI proxy returned 402 – skipping remaining OpenAI models.")
                     break
                 return res
 
-    # ===== 2. Groq (free) =====
+        # --- b) OpenRouter models via aipipe.org/openrouter/v1 ---
+        # If the OpenAI proxy returned SKIP_PROVIDER, skip OpenRouter as well.
+        if res != "SKIP_PROVIDER":
+            for model in [
+                "openai/gpt-4.1-nano",        # very cheap, capable
+                "openai/gpt-4o-mini",         # same as above but via OpenRouter
+                "anthropic/claude-3-haiku",   # fast, cheap, accurate
+            ]:
+                res = call_openai_compatible(
+                    "https://aipipe.org/openrouter/v1",
+                    AIPIPE_API_KEY,
+                    model,
+                    messages,
+                    tools if use_tools else None
+                )
+                if res is not None:
+                    if res == "SKIP_PROVIDER":
+                        log("  AiPipe OpenRouter proxy returned 402 – skipping remaining OpenRouter models.")
+                        break
+                    return res
+
+    # ===== 2. Groq (free, fast) =====
     if GROQ_API_KEY:
         log("  [Groq]")
         for model in [
@@ -297,6 +321,7 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
+    # --- Retry once after a short delay ---
     if retry:
         log("  All providers failed. Retrying once after 2s...")
         time.sleep(2)
