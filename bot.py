@@ -13,7 +13,7 @@ import base64
 import json
 import os
 import re
-import sys               # ← FIX: missing import caused NameError
+import sys
 import threading
 import time
 import traceback
@@ -36,8 +36,8 @@ BASE_URL = os.environ["BASE_URL"]
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 AIPIPE_API_KEY = os.environ.get("AIPIPE_API_KEY", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")          # new
-TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")  # new
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 HF_API_KEY = os.environ.get("HF_API_KEY", "")
 
@@ -89,7 +89,6 @@ def _push_to_github(json_line: str):
             payload["sha"] = sha
         requests.put(url, headers=headers, json=payload)
     except Exception as e:
-        # Silently ignore GitHub push failures – the endpoint still works.
         pass
 
 # ------------------------------------------------------------
@@ -122,16 +121,19 @@ def run_python(code: str) -> str:
     if t.is_alive():
         return f"ERROR: code timed out after {PY_TIMEOUT}s"
     text = out.getvalue()
-    return text[-8000:] if text else "(no output — use print())"
+    # Return only the last 2000 characters to keep the output manageable
+    return text[-2000:] if text else "(no output — use print())"
 
 # ------------------------------------------------------------
-# 5. System prompts (your exact wording)
+# 5. System prompts (ENHANCED for better CSV resilience)
 # ------------------------------------------------------------
 SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON object. Use `run_python` to fetch/compute.
 - Answer the LAST user message; earlier ones are context.
 - Your final output must be a single JSON object with exactly two keys: "answer" and "log_url".
 - The value of "answer" must EXACTLY match the shape requested by the user. For example, if the user asks for {"state": "<state name>"}, your output must be {"answer": {"state": "Assam"}, "log_url": "LOG_URL_PLACEHOLDER"}.
-- If any tool call fails for any reason (parse error, network error, missing data, etc.), STOP using tools immediately and use your own internal knowledge to provide the best possible answer in the exact requested shape. Never output an error object, error message, or "error" key.
+- When fetching data, always check the response status and print a snippet of the raw text (first 500 chars) so you can see the format. If the data is a CSV with messy headers, adjust your code (e.g., use `skiprows`, `header`, or `error_bad_lines=False`) to load it correctly.
+- If a tool call fails, examine the error output. If the error is a parsing issue, try an alternative way to read the data (e.g., request JSON format from the API, or use `csv` module) before giving up.
+- If after several attempts the tool still fails, you must still provide a valid answer in the exact requested shape – use logical reasoning or partial data. **Never** output an answer containing "Data not available", "unknown", or any placeholder. Always output a concrete value that matches the requested type (e.g., a country name, a number).
 - Never output markdown, prose, or extra text. Only the JSON."""
 
 SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code. Give your best answer from your knowledge.
@@ -233,7 +235,7 @@ def call_llm(messages, tools=None, retry=True):
         log("  [OpenRouter]")
         for model in [
             "meta-llama/llama-3.2-3b-instruct:free",
-            "google/gemini-2.0-flash-001",          # still free on OpenRouter
+            "google/gemini-2.0-flash-001",
             "mistralai/mistral-7b-instruct:free",
             "nousresearch/hermes-3-llama-3.1-405b:free",
         ]:
