@@ -46,9 +46,9 @@ GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "run.jsonl")
 
 LOG_URL = f"{BASE_URL}/run.jsonl"
 
-MAX_AGENT_STEPS = 10
-PY_TIMEOUT = 60             # seconds per run_python call
-ANSWER_BUDGET = 300         # total seconds per question (5 min)
+MAX_AGENT_STEPS = 5          # reduced to avoid wasting time on broken loops
+PY_TIMEOUT = 60              # seconds per run_python call
+ANSWER_BUDGET = 300          # total seconds per question (5 min)
 
 # ------------------------------------------------------------
 # 2. Logging helper (stderr)
@@ -129,17 +129,32 @@ def run_python(code: str) -> str:
     return text[-2000:] if text else "(no output — use print())"
 
 # ------------------------------------------------------------
-# 5. System prompt – encourages efficient, targeted web searches
+# 5. System prompt – explicit instructions for WHO / MOSPI / etc.
 # ------------------------------------------------------------
 SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON object. Use `run_python` to fetch/compute.
 - Answer the LAST user message; earlier ones are context.
 - Your final output must be a single JSON object with exactly two keys: "answer" and "log_url".
 - The value of "answer" must EXACTLY match the shape requested by the user.
-- **Data retrieval:** Use DuckDuckGo search (`DDGS().text(query, max_results=3)`) to find dataset URLs or relevant statistics. For known public datasets (MOSPI, WHO GHO, etc.), try the official URL first. If that fails, search for alternative mirrors.
-- Use `wikipedia.search(query)` and `wikipedia.page(title)` for quick factual summaries when appropriate.
-- When you locate a data file (CSV, Excel, HTML table), download it and parse with pandas. Try multiple approaches if parsing fails (e.g., `pd.read_csv(..., on_bad_lines='skip', skiprows=...)`, `pd.read_excel(..., engine='openpyxl')`, `pd.read_html()`). Always print the first 500 characters of the raw response to understand the format.
-- You have up to 10 tool calls. Do NOT give up after one error. Try alternative URLs or methods. If all data fetching fails, you may answer from your own knowledge, but only as a last resort. Never output an error object or placeholder.
-- For simple arithmetic, answer directly.
+
+**How to fetch data correctly:**
+- For WHO Global Health Observatory indicators (like WHOSIS_000001, life expectancy), use the official JSON API:
+  `https://ghoapi.azureedge.net/api/WHOSIS_000001`
+  This returns clean JSON. You can filter by country and year using pandas or direct Python.
+- For MOSPI data, search with `DDGS().text("MOSPI maternal mortality rate table", max_results=3)` and find a direct CSV/Excel file.
+- If a direct API fails, search the web with `DDGS().text()` for alternative mirrors or other reliable sources (e.g., Our World in Data, World Bank).
+- Use `wikipedia.page(title)` for quick factual summaries, but always prefer downloadable datasets for numeric computation.
+
+**When parsing data:**
+- Always print the first 500 characters of the raw response to understand the format.
+- For CSV: try `pd.read_csv(..., on_bad_lines='skip', skiprows=...)`.
+- For HTML tables: use `pd.read_html()` or parse with BeautifulSoup.
+- For Excel: use `pd.read_excel(..., engine='openpyxl')` or `xlrd`.
+- If one method fails, immediately try a completely different approach. Do NOT repeat the same broken request.
+
+**Important:**
+- You have up to 5 tool calls. Use them wisely.
+- If you cannot fetch the exact dataset after multiple attempts, you may use Wikipedia or your own knowledge, but only as a last resort. You must always provide a concrete answer – never an error object, "unknown", or "Data not available".
+- For simple arithmetic, answer directly without tools.
 - Never output markdown, prose, or extra text. Only the JSON."""
 
 SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code. Give your best answer from your knowledge.
@@ -218,11 +233,10 @@ def call_llm(messages, tools=None, retry=True):
     # ===== 1. AiPipe (cheapest models first) =====
     if AIPIPE_API_KEY:
         log("  [AiPipe]")
-        # Use OpenRouter proxy for the cheapest models
         for model in [
-            "openai/gpt-4.1-nano",        # cheapest, capable
-            "openai/gpt-4o-mini",         # still cheap
-            "anthropic/claude-3-haiku",   # fast and cost-effective
+            "openai/gpt-4.1-nano",
+            "openai/gpt-4o-mini",
+            "anthropic/claude-3-haiku",
         ]:
             res = call_openai_compatible(
                 "https://aipipe.org/openrouter/v1",
