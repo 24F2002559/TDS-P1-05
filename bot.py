@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Data-Analyst Telegram Bot – cost‑aware, production version.
+Data-Analyst Telegram Bot – free-first, cost‑aware version.
 
-- Primary LLM: AiPipe (cheap, accurate models via OpenRouter proxy).
-- Fallback providers: Groq, Together, OpenRouter direct (incl. openrouter/free), HuggingFace.
-- Thread pool for concurrent testing, 60 s sandbox timeout, 300 s answer budget.
-- Persistent in‑memory log + GitHub sync, served as plain text.
+- Free providers tried first: Groq → Together → OpenRouter direct (incl. openrouter/free) → HuggingFace.
+- AiPipe used as a final fallback (only if credits are available).
+- Thread pool, 60 s sandbox timeout, 300 s answer budget, persistent log + GitHub sync.
 - Robust JSON extraction and safe argument parsing.
-- System prompt encourages real data fetching and CSV/JSON adaptability.
 """
 
 import base64
@@ -173,9 +171,13 @@ def call_openai_compatible(base_url, api_key, model, messages, tools=None):
             return msg.get("content", "")
         else:
             log(f"  -> {model} returned {resp.status_code}: {resp.text[:200]}")
+            # If 402, signal caller to skip remaining models from this provider
+            if resp.status_code == 402:
+                return "SKIP_PROVIDER"
+            return None
     except Exception as e:
         log(f"  -> {model} error: {e}")
-    return None
+        return None
 
 def call_huggingface(model, messages):
     if not HF_API_KEY:
@@ -201,32 +203,13 @@ def call_huggingface(model, messages):
     return None
 
 # ------------------------------------------------------------
-# 8. Unified LLM caller – cheap first, retry once
+# 8. Unified LLM caller – FREE providers first, AiPipe last
 # ------------------------------------------------------------
 def call_llm(messages, tools=None, retry=True):
     use_tools = tools is not None
     log("Trying LLM providers...")
 
-    # --- 1. AiPipe with cheap & accurate models ---
-    if AIPIPE_API_KEY:
-        log("  [AiPipe]")
-        # Models ordered by cost & capability (cheapest first)
-        for model in [
-            "openai/gpt-4.1-nano",        # very cheap, capable
-            "openai/gpt-4o-mini",         # still cheap, stronger
-            "anthropic/claude-3-haiku",   # fast, cheap, accurate
-        ]:
-            res = call_openai_compatible(
-                "https://aipipe.org/openrouter/v1",   # AiPipe proxies to OpenRouter
-                AIPIPE_API_KEY,
-                model,
-                messages,
-                tools if use_tools else None
-            )
-            if res is not None:
-                return res
-
-    # --- 2. Groq (free, fast) ---
+    # --- 1. Groq (free, fast) ---
     if GROQ_API_KEY:
         log("  [Groq]")
         for model in ["llama-3.1-8b-instant", "mixtral-8x7b-32768"]:
@@ -240,7 +223,7 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # --- 3. Together AI (free) ---
+    # --- 2. Together AI (free) ---
     if TOGETHER_API_KEY:
         log("  [Together]")
         for model in ["meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"]:
@@ -254,11 +237,11 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # --- 4. OpenRouter direct (includes free models) ---
+    # --- 3. OpenRouter direct (free models) ---
     if OPENROUTER_API_KEY:
         log("  [OpenRouter direct]")
         for model in [
-            "openrouter/free",                          # completely free tier
+            "openrouter/free",
             "meta-llama/llama-3.2-3b-instruct:free",
             "mistralai/mistral-7b-instruct:free",
             "google/gemma-2-9b-it:free",
@@ -273,12 +256,33 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # --- 5. HuggingFace (text only, no tools) ---
+    # --- 4. HuggingFace (text only, no tools) ---
     if not use_tools and HF_API_KEY:
         log("  [HuggingFace]")
         for model in ["mistralai/Mistral-7B-Instruct-v0.3"]:
             res = call_huggingface(model, messages)
             if res is not None:
+                return res
+
+    # --- 5. AiPipe (last resort, skip if out of credits) ---
+    if AIPIPE_API_KEY:
+        log("  [AiPipe]")
+        for model in [
+            "openai/gpt-4.1-nano",
+            "openai/gpt-4o-mini",
+            "anthropic/claude-3-haiku",
+        ]:
+            res = call_openai_compatible(
+                "https://aipipe.org/openrouter/v1",
+                AIPIPE_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
+            if res is not None:
+                if res == "SKIP_PROVIDER":
+                    log("  AiPipe returned 402 – skipping remaining AiPipe models.")
+                    break
                 return res
 
     # --- Retry once after a short delay ---
