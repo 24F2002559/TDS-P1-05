@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Data-Analyst Telegram Bot – internet‑enabled, free providers.
+Data-Analyst Telegram Bot – cheapest models first, internet‑enabled.
 
-- Primary: AiPipe (OpenAI + OpenRouter proxy) for best accuracy.
-- Fallbacks (free): Groq → OpenRouter direct (incl. openrouter/free) → HuggingFace.
-- Internet search via DuckDuckGo, Wikipedia, and generic HTTP fetches.
-- Handles CSV, Excel, JSON, HTML tables.
+- Primary: AiPipe (cheapest models: gpt-4.1-nano → gpt-4o-mini → claude-3-haiku)
+- Fallbacks (free): Groq → OpenRouter direct → HuggingFace
+- Internet search via DuckDuckGo (DDGS from ddgs), Wikipedia, and generic HTTP fetches.
 - Thread pool, 60 s sandbox timeout, 300 s answer budget, persistent log + GitHub sync.
 - Robust JSON extraction and safe argument parsing.
 """
@@ -91,7 +90,7 @@ def _push_to_github(json_line: str):
         pass
 
 # ------------------------------------------------------------
-# 4. Safe Python sandbox – includes internet search & Wikipedia
+# 4. Safe Python sandbox – internet, Wikipedia, parsing
 # ------------------------------------------------------------
 def run_python(code: str) -> str:
     out = StringIO()
@@ -105,8 +104,8 @@ def run_python(code: str) -> str:
             "BeautifulSoup": __import__("bs4").BeautifulSoup,
             "openpyxl": __import__("openpyxl"),
             "json": __import__("json"),
-            # Internet search & Wikipedia
-            "DDGS": __import__("duckduckgo_search").DDGS,
+            # Updated DuckDuckGo import
+            "DDGS": __import__("ddgs").DDGS,
             "wikipedia": __import__("wikipedia"),
             # Additional parsing helpers
             "lxml": __import__("lxml"),
@@ -127,22 +126,20 @@ def run_python(code: str) -> str:
     if t.is_alive():
         return f"ERROR: code timed out after {PY_TIMEOUT}s"
     text = out.getvalue()
-    # Keep last 2000 chars – enough to see errors but not overwhelm the model
     return text[-2000:] if text else "(no output — use print())"
 
 # ------------------------------------------------------------
-# 5. System prompts (data‑fetching optimised, with internet search)
+# 5. System prompt – encourages efficient, targeted web searches
 # ------------------------------------------------------------
 SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON object. Use `run_python` to fetch/compute.
 - Answer the LAST user message; earlier ones are context.
 - Your final output must be a single JSON object with exactly two keys: "answer" and "log_url".
-- The value of "answer" must EXACTLY match the shape requested by the user. For example, if the user asks for {"state": "<state name>"}, your output must be {"answer": {"state": "Assam"}, "log_url": "LOG_URL_PLACEHOLDER"}.
-- **Internet data retrieval:** You have access to DuckDuckGo search (`DDGS`) and Wikipedia. If a specific dataset URL is not given, or if the data fetch fails, search the web to find the required statistics. Use keywords like "MOSPI maternal mortality rate table", "WHO WHOSIS_000001 CSV", or the exact indicator requested.
-- Use `DDGS().text(query, max_results=5)` to get search result snippets, or `DDGS().answers(query)` for instant answers. You can also use `wikipedia.search(query)` and `wikipedia.page(title)` to retrieve articles.
-- When you find a data source, download it (CSV, Excel, HTML) and parse it with pandas or BeautifulSoup. Try multiple parsers (e.g., `pd.read_csv(..., on_bad_lines='skip')`, `pd.read_excel(..., engine='openpyxl' or 'xlrd')`, `pd.read_html()`). Always inspect the raw text first (first 500 chars) to understand the format.
-- If a download fails, try alternative URLs from the search results. Do NOT give up after one error.
-- If after several attempts the data is still unavailable, you may fall back to Wikipedia summaries or your own knowledge, but you must always output a concrete answer – never "Data not available" or "unknown".
-- For simple arithmetic (like "2+2"), answer directly without tools.
+- The value of "answer" must EXACTLY match the shape requested by the user.
+- **Data retrieval:** Use DuckDuckGo search (`DDGS().text(query, max_results=3)`) to find dataset URLs or relevant statistics. For known public datasets (MOSPI, WHO GHO, etc.), try the official URL first. If that fails, search for alternative mirrors.
+- Use `wikipedia.search(query)` and `wikipedia.page(title)` for quick factual summaries when appropriate.
+- When you locate a data file (CSV, Excel, HTML table), download it and parse with pandas. Try multiple approaches if parsing fails (e.g., `pd.read_csv(..., on_bad_lines='skip', skiprows=...)`, `pd.read_excel(..., engine='openpyxl')`, `pd.read_html()`). Always print the first 500 characters of the raw response to understand the format.
+- You have up to 10 tool calls. Do NOT give up after one error. Try alternative URLs or methods. If all data fetching fails, you may answer from your own knowledge, but only as a last resort. Never output an error object or placeholder.
+- For simple arithmetic, answer directly.
 - Never output markdown, prose, or extra text. Only the JSON."""
 
 SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code. Give your best answer from your knowledge.
@@ -212,24 +209,23 @@ def call_huggingface(model, messages):
     return None
 
 # ------------------------------------------------------------
-# 8. Unified LLM caller – AiPipe first, then free fallbacks
+# 8. Unified LLM caller – cheapest first
 # ------------------------------------------------------------
 def call_llm(messages, tools=None, retry=True):
     use_tools = tools is not None
     log("Trying LLM providers...")
 
-    skip_aipipe_openrouter = False
+    # ===== 1. AiPipe (cheapest models first) =====
     if AIPIPE_API_KEY:
         log("  [AiPipe]")
-
-        # --- a) OpenAI models via aipipe.org/openai/v1 ---
+        # Use OpenRouter proxy for the cheapest models
         for model in [
-            "gpt-4",
-            "gpt-4o-mini",
-            "gpt-3.5-turbo",
+            "openai/gpt-4.1-nano",        # cheapest, capable
+            "openai/gpt-4o-mini",         # still cheap
+            "anthropic/claude-3-haiku",   # fast and cost-effective
         ]:
             res = call_openai_compatible(
-                "https://aipipe.org/openai/v1",
+                "https://aipipe.org/openrouter/v1",
                 AIPIPE_API_KEY,
                 model,
                 messages,
@@ -237,30 +233,9 @@ def call_llm(messages, tools=None, retry=True):
             )
             if res is not None:
                 if res == "SKIP_PROVIDER":
-                    log("  AiPipe OpenAI proxy returned 402 – skipping remaining AiPipe models.")
-                    skip_aipipe_openrouter = True
+                    log("  AiPipe returned 402 – skipping remaining AiPipe models.")
                     break
                 return res
-
-        # --- b) OpenRouter models via aipipe.org/openrouter/v1 ---
-        if not skip_aipipe_openrouter:
-            for model in [
-                "openai/gpt-4.1-nano",
-                "openai/gpt-4o-mini",
-                "anthropic/claude-3-haiku",
-            ]:
-                res = call_openai_compatible(
-                    "https://aipipe.org/openrouter/v1",
-                    AIPIPE_API_KEY,
-                    model,
-                    messages,
-                    tools if use_tools else None
-                )
-                if res is not None:
-                    if res == "SKIP_PROVIDER":
-                        log("  AiPipe OpenRouter proxy returned 402 – skipping remaining OpenRouter models.")
-                        break
-                    return res
 
     # ===== 2. Groq (free) =====
     if GROQ_API_KEY:
@@ -317,7 +292,7 @@ def call_llm(messages, tools=None, retry=True):
     return None
 
 # ------------------------------------------------------------
-# 9. Agent loop – improved tool error feedback
+# 9. Agent loop
 # ------------------------------------------------------------
 def agent_loop(history):
     deadline = time.time() + ANSWER_BUDGET
@@ -326,7 +301,7 @@ def agent_loop(history):
         "type": "function",
         "function": {
             "name": "run_python",
-            "description": "Run Python code to fetch/compute. You can use DDGS (DuckDuckGo search), wikipedia, pandas, requests, BeautifulSoup, etc.",
+            "description": "Execute Python code. You can use DDGS (DuckDuckGo), wikipedia, pandas, requests, etc.",
             "parameters": {
                 "type": "object",
                 "properties": {"code": {"type": "string"}},
@@ -364,7 +339,7 @@ def agent_loop(history):
                 # Robust argument parsing
                 args_str = tc["function"]["arguments"]
                 if not args_str or not args_str.strip():
-                    out = "Tool call arguments were empty. Please provide a valid JSON object containing a 'code' key with your Python code as a string."
+                    out = "Tool call arguments were empty. Please provide a valid JSON object with a 'code' key."
                     log("Tool arguments empty – asking model to retry.")
                 else:
                     try:
@@ -372,7 +347,7 @@ def agent_loop(history):
                         code = args["code"]
                     except (json.JSONDecodeError, KeyError) as e:
                         log(f"Tool arguments error: {e}")
-                        out = f"Error parsing arguments: {e}. Please ensure you send a valid JSON with a 'code' key. Try again."
+                        out = f"Error parsing arguments: {e}. Please ensure you send valid JSON with a 'code' key."
                         push_log_line(json.dumps({
                             "time": datetime.now(timezone.utc).isoformat(),
                             "type": "tool_parse_error",
@@ -396,9 +371,9 @@ def agent_loop(history):
                         "output": out
                     }))
                     if out.startswith("Error:"):
-                        out += "\n[System: Tool failed. You may try a different approach or use another data source.]"
+                        out += "\n[System: Tool failed. Try a different approach or search for an alternative data source.]"
                 else:
-                    # Empty arguments case – we already set `out` above
+                    # Empty arguments – already set out above
                     pass
 
                 messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
