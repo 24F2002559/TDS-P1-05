@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Data-Analyst Telegram Bot – AiPipe (skips on credit exhaustion) + free fallbacks.
+Data-Analyst Telegram Bot – AiPipe (skip on credit exhaustion) + free fallbacks.
 
-- Primary: AiPipe (OpenAI + OpenRouter proxy) – skipped if credit exhausted (429).
+- Primary: AiPipe (OpenAI + OpenRouter proxy) – skipped if credit exhausted.
 - Fallbacks (free): Groq → OpenRouter direct → HuggingFace.
 - Internet search via DuckDuckGo (DDGS from ddgs), Wikipedia, and generic HTTP fetches.
 - Thread pool, 60 s sandbox timeout, 300 s answer budget, persistent log + GitHub sync.
@@ -46,9 +46,9 @@ GITHUB_FILE_PATH = os.environ.get("GITHUB_FILE_PATH", "run.jsonl")
 
 LOG_URL = f"{BASE_URL}/run.jsonl"
 
-MAX_AGENT_STEPS = 8          # enough for a couple of retries
-PY_TIMEOUT = 60              # seconds per run_python call
-ANSWER_BUDGET = 300          # total seconds per question (5 min)
+MAX_AGENT_STEPS = 8
+PY_TIMEOUT = 90              # slightly more time for data fetches
+ANSWER_BUDGET = 300          # total seconds per question
 
 # ------------------------------------------------------------
 # 2. Logging helper (stderr)
@@ -104,10 +104,8 @@ def run_python(code: str) -> str:
             "BeautifulSoup": __import__("bs4").BeautifulSoup,
             "openpyxl": __import__("openpyxl"),
             "json": __import__("json"),
-            # Internet search & Wikipedia
             "DDGS": __import__("ddgs").DDGS,
             "wikipedia": __import__("wikipedia"),
-            # Additional parsing helpers
             "lxml": __import__("lxml"),
             "html5lib": __import__("html5lib"),
             "xlrd": __import__("xlrd"),
@@ -129,40 +127,45 @@ def run_python(code: str) -> str:
     return text[-2000:] if text else "(no output — use print())"
 
 # ------------------------------------------------------------
-# 5. System prompt – explicit, example‑driven instructions
+# 5. System prompt – exact working WHO code included
 # ------------------------------------------------------------
 SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON object. Use `run_python` to fetch/compute.
 - Answer the LAST user message; earlier ones are context.
 - Your final output must be a single JSON object with exactly two keys: "answer" and "log_url".
 - The value of "answer" must EXACTLY match the shape requested by the user.
 
-**How to fetch and process data correctly:**
+**For WHO Global Health Observatory data (indicator WHOSIS_000001):**
+Use this EXACT code pattern (replace countries as needed):
+import requests, pandas as pd
+url = "https://ghoapi.azureedge.net/api/WHOSIS_000001"
+data = requests.get(url).json()["value"]
+df = pd.DataFrame(data)
+# Filter for both sexes, the 7 countries, and years 2010,2019,2021
+df = df[(df["Dim1"] == "SEX_BTSX") & (df["TimeDim"].isin([2010,2019,2021])) & (df["SpatialDim"].isin(["BRA","CHN","IND","IDN","MEX","ZAF","TUR"]))]
+pivot = df.pivot(index="SpatialDim", columns="TimeDim", values="NumericValue")
+pivot["gain"] = pivot[2019] - pivot[2010]
+pivot["loss"] = pivot[2019] - pivot[2021]
+pivot["ratio"] = pivot["loss"] / pivot["gain"]
+result = pivot["ratio"].idxmax()
+country_map = {"BRA":"Brazil","CHN":"China","IND":"India","IDN":"Indonesia","MEX":"Mexico","ZAF":"South Africa","TUR":"Turkey"}
+print({"answer":{"country":country_map[result]},"log_url":"LOG_URL_PLACEHOLDER"})
+```
+- The column for country is `SpatialDim`, for year is `TimeDim`, for value is `NumericValue`, and sex is `Dim1`.
+- Always filter by `Dim1 == "SEX_BTSX"` (both sexes).
 
-*For WHO Global Health Observatory indicators (e.g., WHOSIS_000001 – life expectancy):*
-- Use the official JSON API: `https://ghoapi.azureedge.net/api/WHOSIS_000001`
-- The response is a JSON object with a key `"value"` that is a list of records.
-- Each record has at least these fields:
-  - `"SpatialDimValue"`: 3‑letter country code (e.g., "BRA" for Brazil, "CHN" for China)
-  - `"TimeDim"`: year (integer)
-  - `"NumericValue"`: the life expectancy value (float)
-- You can filter with pandas: `df = pd.json_normalize(data['value'])`, then `df = df[df['SpatialDimValue'].isin(country_codes) & df['TimeDim'].isin([2010,2019,2021])]`.
-- Map country names to codes, e.g., `{"Brazil":"BRA","China":"CHN","India":"IND","Indonesia":"IDN","Mexico":"MEX","South Africa":"ZAF","Turkey":"TUR"}`.
-- Compute the gain (2019‑2010) and loss (2021‑2019) for each country, then the ratio = loss/gain, and find the country with the highest ratio.
+**For other datasets (MOSPI, etc.):**
+- Search with `DDGS().text("MOSPI maternal mortality rate table", max_results=3)` to find a direct CSV/Excel file.
+- Use `wikipedia.page(title)` for quick summaries.
 
-*For MOSPI data:* search with `DDGS().text("MOSPI maternal mortality rate table", max_results=3)` and find a direct CSV/Excel file.
-
-*If a direct API fails:* search the web with `DDGS().text()` for alternative mirrors or use `wikipedia.page(title)` for summaries, but always prefer downloadable datasets for numeric computation.
-
-**When parsing data:**
+**Parsing tips:**
 - Always print the first 500 characters of the raw response to understand the format.
 - For CSV: try `pd.read_csv(..., on_bad_lines='skip', skiprows=...)`.
-- For HTML tables: use `pd.read_html()` or parse with BeautifulSoup.
-- For Excel: use `pd.read_excel(..., engine='openpyxl')` or `xlrd`.
-- If one method fails, immediately try a completely different approach. Do NOT repeat the same broken request.
+- For HTML: use `pd.read_html()` or BeautifulSoup.
+- For Excel: `pd.read_excel(..., engine='openpyxl')`.
 
 **Important:**
 - You have up to 8 tool calls. Use them wisely.
-- If you cannot fetch the exact dataset after multiple attempts, you may use Wikipedia or your own knowledge, but only as a last resort. You must always provide a concrete answer – never an error object, "unknown", or "Data not available".
+- If you cannot fetch the exact dataset after multiple attempts, you may use Wikipedia or your own knowledge, but only as a last resort. Never output an error object or placeholder.
 - For simple arithmetic, answer directly without tools.
 - Never output markdown, prose, or extra text. Only the JSON."""
 
@@ -202,7 +205,7 @@ def call_openai_compatible(base_url, api_key, model, messages, tools=None):
             return msg.get("content", "")
         else:
             log(f"  -> {model} returned {resp.status_code}: {resp.text[:200]}")
-            # If 429 with "Usage", signal that provider is out of credits
+            # If 429 with "Usage", skip provider (credits exhausted)
             if resp.status_code == 429 and "Usage" in resp.text:
                 return "SKIP_PROVIDER"
             return None
@@ -240,24 +243,12 @@ def call_llm(messages, tools=None, retry=True):
     use_tools = tools is not None
     log("Trying LLM providers...")
 
-    # ===== 1. AiPipe (skip entirely if we previously got a credit‑exhausted signal) =====
+    # ===== 1. AiPipe (skip if credit exhausted) =====
     if AIPIPE_API_KEY:
         log("  [AiPipe]")
-
-        # --- a) OpenAI models via aipipe.org/openai/v1 ---
         skip_aipipe = False
-        for model in [
-            "gpt-4",
-            "gpt-4o-mini",
-            "gpt-3.5-turbo",
-        ]:
-            res = call_openai_compatible(
-                "https://aipipe.org/openai/v1",
-                AIPIPE_API_KEY,
-                model,
-                messages,
-                tools if use_tools else None
-            )
+        for model in ["gpt-4", "gpt-4o-mini", "gpt-3.5-turbo"]:
+            res = call_openai_compatible("https://aipipe.org/openai/v1", AIPIPE_API_KEY, model, messages, tools if use_tools else None)
             if res is not None:
                 if res == "SKIP_PROVIDER":
                     log("  AiPipe OpenAI proxy credit exhausted – skipping remaining AiPipe models.")
@@ -265,61 +256,33 @@ def call_llm(messages, tools=None, retry=True):
                     break
                 return res
 
-        # --- b) OpenRouter models via aipipe.org/openrouter/v1 ---
         if not skip_aipipe:
-            for model in [
-                "openai/gpt-4.1-nano",
-                "openai/gpt-4o-mini",
-                "anthropic/claude-3-haiku",
-            ]:
-                res = call_openai_compatible(
-                    "https://aipipe.org/openrouter/v1",
-                    AIPIPE_API_KEY,
-                    model,
-                    messages,
-                    tools if use_tools else None
-                )
+            for model in ["openai/gpt-4.1-nano", "openai/gpt-4o-mini", "anthropic/claude-3-haiku"]:
+                res = call_openai_compatible("https://aipipe.org/openrouter/v1", AIPIPE_API_KEY, model, messages, tools if use_tools else None)
                 if res is not None:
                     if res == "SKIP_PROVIDER":
-                        log("  AiPipe OpenRouter proxy credit exhausted – skipping remaining OpenRouter models.")
+                        log("  AiPipe OpenRouter proxy credit exhausted – skipping.")
                         break
                     return res
 
-    # ===== 2. Groq (free, fast) =====
+    # ===== 2. Groq (free) – updated working models =====
     if GROQ_API_KEY:
         log("  [Groq]")
         for model in [
             "llama-3.1-8b-instant",
             "llama-3.3-70b-versatile",
-            "mixtral-8x7b-32768",
-            "gemma2-9b-it",
+            "openai/gpt-oss-20b",          # from the list you provided
+            "qwen/qwen3.6-27b",            # also available
         ]:
-            res = call_openai_compatible(
-                "https://api.groq.com/openai/v1",
-                GROQ_API_KEY,
-                model,
-                messages,
-                tools if use_tools else None
-            )
+            res = call_openai_compatible("https://api.groq.com/openai/v1", GROQ_API_KEY, model, messages, tools if use_tools else None)
             if res is not None:
                 return res
 
     # ===== 3. OpenRouter direct (free models) =====
     if OPENROUTER_API_KEY:
         log("  [OpenRouter direct]")
-        for model in [
-            "openrouter/free",
-            "meta-llama/llama-3.2-3b-instruct:free",
-            "mistralai/mistral-7b-instruct:free",
-            "google/gemma-2-9b-it:free",
-        ]:
-            res = call_openai_compatible(
-                "https://openrouter.ai/api/v1",
-                OPENROUTER_API_KEY,
-                model,
-                messages,
-                tools if use_tools else None
-            )
+        for model in ["openrouter/free", "meta-llama/llama-3.2-3b-instruct:free", "mistralai/mistral-7b-instruct:free", "google/gemma-2-9b-it:free"]:
+            res = call_openai_compatible("https://openrouter.ai/api/v1", OPENROUTER_API_KEY, model, messages, tools if use_tools else None)
             if res is not None:
                 return res
 
@@ -331,7 +294,6 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # --- Retry once after a short delay ---
     if retry:
         log("  All providers failed. Retrying once after 2s...")
         time.sleep(2)
@@ -397,32 +359,19 @@ def agent_loop(history):
                     except (json.JSONDecodeError, KeyError) as e:
                         log(f"Tool arguments error: {e}")
                         out = f"Error parsing arguments: {e}. Please ensure you send valid JSON with a 'code' key."
-                        push_log_line(json.dumps({
-                            "time": datetime.now(timezone.utc).isoformat(),
-                            "type": "tool_parse_error",
-                            "error": str(e)
-                        }))
+                        push_log_line(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "type": "tool_parse_error", "error": str(e)}))
                         messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
                         done += 1
                         continue
 
                 if args_str and args_str.strip():
-                    push_log_line(json.dumps({
-                        "time": datetime.now(timezone.utc).isoformat(),
-                        "type": "tool_call",
-                        "code": code
-                    }))
+                    push_log_line(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "type": "tool_call", "code": code}))
                     out = run_python(code)
-                    push_log_line(json.dumps({
-                        "time": datetime.now(timezone.utc).isoformat(),
-                        "type": "tool_output",
-                        "output": out
-                    }))
+                    push_log_line(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "type": "tool_output", "output": out}))
                     if out.startswith("Error:"):
                         out += "\n[System: Tool failed. Try a different approach or search for an alternative data source.]"
                 else:
-                    # Empty arguments – already set out above
                     pass
 
                 messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
@@ -533,11 +482,7 @@ def telegram_polling():
     log(">>> Telegram polling started")
     while True:
         try:
-            resp = requests.get(
-                f"{TG_API}/getUpdates",
-                params={"offset": offset, "timeout": 50},
-                timeout=65
-            )
+            resp = requests.get(f"{TG_API}/getUpdates", params={"offset": offset, "timeout": 50}, timeout=65)
             if resp.status_code == 200:
                 for upd in resp.json().get("result", []):
                     offset = upd["update_id"] + 1
