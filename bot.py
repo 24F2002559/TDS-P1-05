@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Data-Analyst Telegram Bot – production version (all free providers).
+Data-Analyst Telegram Bot – cost‑aware, production version.
 
-- In‑memory logging served as plain text + GitHub sync.
-- Multi‑provider fallback: AiPipe → Groq → Together → OpenRouter → HuggingFace.
-- Thread pool for concurrent TA testing.
-- Python sandbox timeout (60 s), 300 s answer budget, LLM retries.
-- Robust JSON extraction & safe argument parsing.
+- Primary LLM: AiPipe (cheap, accurate models via OpenRouter proxy).
+- Fallback providers: Groq, Together, OpenRouter direct (incl. openrouter/free), HuggingFace.
+- Thread pool for concurrent testing, 60 s sandbox timeout, 300 s answer budget.
+- Persistent in‑memory log + GitHub sync, served as plain text.
+- Robust JSON extraction and safe argument parsing.
+- System prompt encourages real data fetching and CSV/JSON adaptability.
 """
 
 import base64
@@ -65,7 +66,6 @@ local_log_lines = []
 def push_log_line(line: str):
     """Append to in‑memory list and push to GitHub in a background thread."""
     local_log_lines.append(line)
-    # GitHub sync
     if GITHUB_TOKEN and GITHUB_REPO:
         threading.Thread(target=_push_to_github, args=(line,), daemon=True).start()
 
@@ -88,7 +88,7 @@ def _push_to_github(json_line: str):
         if sha:
             payload["sha"] = sha
         requests.put(url, headers=headers, json=payload)
-    except Exception as e:
+    except Exception:
         pass
 
 # ------------------------------------------------------------
@@ -121,19 +121,20 @@ def run_python(code: str) -> str:
     if t.is_alive():
         return f"ERROR: code timed out after {PY_TIMEOUT}s"
     text = out.getvalue()
-    # Return only the last 2000 characters to keep the output manageable
+    # Keep last 2000 chars – enough to see errors but not overwhelm the model
     return text[-2000:] if text else "(no output — use print())"
 
 # ------------------------------------------------------------
-# 5. System prompts (ENHANCED for better CSV resilience)
+# 5. System prompts (data‑fetching optimised)
 # ------------------------------------------------------------
 SYSTEM_PROMPT_TOOLS = """You are a data analyst bot. Answer ONLY with a JSON object. Use `run_python` to fetch/compute.
 - Answer the LAST user message; earlier ones are context.
 - Your final output must be a single JSON object with exactly two keys: "answer" and "log_url".
 - The value of "answer" must EXACTLY match the shape requested by the user. For example, if the user asks for {"state": "<state name>"}, your output must be {"answer": {"state": "Assam"}, "log_url": "LOG_URL_PLACEHOLDER"}.
-- When fetching data, always check the response status and print a snippet of the raw text (first 500 chars) so you can see the format. If the data is a CSV with messy headers, adjust your code (e.g., use `skiprows`, `header`, or `error_bad_lines=False`) to load it correctly.
-- If a tool call fails, examine the error output. If the error is a parsing issue, try an alternative way to read the data (e.g., request JSON format from the API, or use `csv` module) before giving up.
-- If after several attempts the tool still fails, you must still provide a valid answer in the exact requested shape – use logical reasoning or partial data. **Never** output an answer containing "Data not available", "unknown", or any placeholder. Always output a concrete value that matches the requested type (e.g., a country name, a number).
+- **Fetching public data:** Always check the response status. Print the first 500 characters of the raw response to understand its format. If the data is CSV and pandas fails, try using Python's built-in `csv` module, or try different `read_csv` options like `skiprows=3`, `header=0`, `on_bad_lines='skip'`. If the API provides JSON (e.g. WHO GHO), use the JSON endpoint (often by changing `.csv` to `.json` or adding `?format=json`).
+- If a tool call fails, examine the error. If it's a parsing problem, attempt an alternative method before giving up.
+- If after several attempts the tool still fails, you must still provide a valid answer in the exact requested shape – use logical reasoning or partial data. **Never** output an answer containing "Data not available", "unknown", or any placeholder. Always output a concrete value that matches the requested type.
+- For simple arithmetic questions (like "What is 2+2?"), you may answer directly without using tools.
 - Never output markdown, prose, or extra text. Only the JSON."""
 
 SYSTEM_PROMPT_NO_TOOLS = """You are a data analyst bot. You cannot run code. Give your best answer from your knowledge.
@@ -200,50 +201,79 @@ def call_huggingface(model, messages):
     return None
 
 # ------------------------------------------------------------
-# 8. Unified LLM caller with RETRY
+# 8. Unified LLM caller – cheap first, retry once
 # ------------------------------------------------------------
 def call_llm(messages, tools=None, retry=True):
     use_tools = tools is not None
     log("Trying LLM providers...")
 
-    # 1. AiPipe
+    # --- 1. AiPipe with cheap & accurate models ---
     if AIPIPE_API_KEY:
         log("  [AiPipe]")
-        for model in ["gpt-4", "gpt-3.5-turbo", "gpt-4o-mini", "gpt-4-turbo", "gpt-4-0613"]:
-            res = call_openai_compatible("https://aipipe.org/openai/v1", AIPIPE_API_KEY, model, messages, tools if use_tools else None)
+        # Models ordered by cost & capability (cheapest first)
+        for model in [
+            "openai/gpt-4.1-nano",        # very cheap, capable
+            "openai/gpt-4o-mini",         # still cheap, stronger
+            "anthropic/claude-3-haiku",   # fast, cheap, accurate
+        ]:
+            res = call_openai_compatible(
+                "https://aipipe.org/openrouter/v1",   # AiPipe proxies to OpenRouter
+                AIPIPE_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
             if res is not None:
                 return res
 
-    # 2. Groq (free)
+    # --- 2. Groq (free, fast) ---
     if GROQ_API_KEY:
         log("  [Groq]")
-        for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]:
-            res = call_openai_compatible("https://api.groq.com/openai/v1", GROQ_API_KEY, model, messages, tools if use_tools else None)
+        for model in ["llama-3.1-8b-instant", "mixtral-8x7b-32768"]:
+            res = call_openai_compatible(
+                "https://api.groq.com/openai/v1",
+                GROQ_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
             if res is not None:
                 return res
 
-    # 3. Together AI (free)
+    # --- 3. Together AI (free) ---
     if TOGETHER_API_KEY:
         log("  [Together]")
-        for model in ["meta-llama/Llama-3.3-70B-Instruct-Turbo-Free", "mistralai/Mistral-7B-Instruct-v0.1"]:
-            res = call_openai_compatible("https://api.together.xyz/v1", TOGETHER_API_KEY, model, messages, tools if use_tools else None)
+        for model in ["meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"]:
+            res = call_openai_compatible(
+                "https://api.together.xyz/v1",
+                TOGETHER_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
             if res is not None:
                 return res
 
-    # 4. OpenRouter (free tier – updated model list)
+    # --- 4. OpenRouter direct (includes free models) ---
     if OPENROUTER_API_KEY:
-        log("  [OpenRouter]")
+        log("  [OpenRouter direct]")
         for model in [
+            "openrouter/free",                          # completely free tier
             "meta-llama/llama-3.2-3b-instruct:free",
-            "google/gemini-2.0-flash-001",
             "mistralai/mistral-7b-instruct:free",
-            "nousresearch/hermes-3-llama-3.1-405b:free",
+            "google/gemma-2-9b-it:free",
         ]:
-            res = call_openai_compatible("https://openrouter.ai/api/v1", OPENROUTER_API_KEY, model, messages, tools if use_tools else None)
+            res = call_openai_compatible(
+                "https://openrouter.ai/api/v1",
+                OPENROUTER_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
             if res is not None:
                 return res
 
-    # 5. HuggingFace (text only, no tools)
+    # --- 5. HuggingFace (text only, no tools) ---
     if not use_tools and HF_API_KEY:
         log("  [HuggingFace]")
         for model in ["mistralai/Mistral-7B-Instruct-v0.3"]:
@@ -251,7 +281,7 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # Retry once after a short delay
+    # --- Retry once after a short delay ---
     if retry:
         log("  All providers failed. Retrying once after 2s...")
         time.sleep(2)
@@ -261,7 +291,7 @@ def call_llm(messages, tools=None, retry=True):
     return None
 
 # ------------------------------------------------------------
-# 9. Agent loop (your logic, but with 300 s budget)
+# 9. Agent loop (same logic, 300 s budget)
 # ------------------------------------------------------------
 def agent_loop(history):
     deadline = time.time() + ANSWER_BUDGET
@@ -348,7 +378,6 @@ def agent_loop(history):
 # 10. JSON extraction & answer shaping
 # ------------------------------------------------------------
 def extract_json(text):
-    # Strip markdown fences if present
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
     start = text.find('{')
     if start == -1:
@@ -391,7 +420,7 @@ def process_llm_output(raw):
     return data
 
 # ------------------------------------------------------------
-# 11. Conversation history (thread‑safe, for multi‑turn)
+# 11. Conversation history (thread‑safe)
 # ------------------------------------------------------------
 history_store = {}
 _hist_lock = threading.Lock()
@@ -425,7 +454,6 @@ def process_message(chat_id, user_text):
         }))
         log(f"ERROR: {traceback.format_exc()}")
 
-    # Send reply
     try:
         requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": reply_text})
     except Exception as send_err:
@@ -437,7 +465,7 @@ def process_message(chat_id, user_text):
             history_store[chat_id] = history_store[chat_id][-20:]
 
 # ------------------------------------------------------------
-# 12. Telegram polling (with THREAD POOL)
+# 12. Telegram polling (thread pool)
 # ------------------------------------------------------------
 def telegram_polling():
     offset = 0
@@ -464,7 +492,7 @@ def telegram_polling():
             time.sleep(5)
 
 # ------------------------------------------------------------
-# 13. FastAPI app – inline run.jsonl (not a file download)
+# 13. FastAPI app – inline run.jsonl
 # ------------------------------------------------------------
 app = FastAPI()
 
@@ -474,7 +502,6 @@ def health():
 
 @app.api_route("/run.jsonl", methods=["GET", "HEAD"])
 def run_log():
-    """Return the accumulated log lines as plain text (displays inline)."""
     content = "\n".join(local_log_lines)
     return PlainTextResponse(content, media_type="text/plain")
 
