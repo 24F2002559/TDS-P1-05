@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Data-Analyst Telegram Bot – free-first, cost‑aware version.
+Data-Analyst Telegram Bot – AiPipe primary, free fallbacks.
 
-- Free providers tried first: Groq → Together → OpenRouter direct (incl. openrouter/free) → HuggingFace.
-- AiPipe used as a final fallback (only if credits are available).
+- Primary: AiPipe (OpenAI + OpenRouter proxy) for best accuracy.
+- Fallbacks (free): Groq → OpenRouter direct (incl. openrouter/free) → HuggingFace.
 - Thread pool, 60 s sandbox timeout, 300 s answer budget, persistent log + GitHub sync.
 - Robust JSON extraction and safe argument parsing.
 """
@@ -36,7 +36,6 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 AIPIPE_API_KEY = os.environ.get("AIPIPE_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 HF_API_KEY = os.environ.get("HF_API_KEY", "")
 
@@ -171,7 +170,7 @@ def call_openai_compatible(base_url, api_key, model, messages, tools=None):
             return msg.get("content", "")
         else:
             log(f"  -> {model} returned {resp.status_code}: {resp.text[:200]}")
-            # If 402, signal caller to skip remaining models from this provider
+            # If 402 (payment required), signal caller to skip remaining models of this provider
             if resp.status_code == 402:
                 return "SKIP_PROVIDER"
             return None
@@ -203,13 +202,62 @@ def call_huggingface(model, messages):
     return None
 
 # ------------------------------------------------------------
-# 8. Unified LLM caller – FREE providers first, AiPipe last
+# 8. Unified LLM caller – AiPipe first (OpenAI + OpenRouter proxy), then free fallbacks
 # ------------------------------------------------------------
 def call_llm(messages, tools=None, retry=True):
     use_tools = tools is not None
     log("Trying LLM providers...")
 
-    # --- 1. Groq (free, fast) ---
+    # ===== 1. AiPipe (primary – best accuracy) =====
+    if AIPIPE_API_KEY:
+        log("  [AiPipe]")
+
+        # --- a) OpenAI models via aipipe.org/openai/v1 ---
+        for model in [
+            "gpt-4",                 # strongest
+            "gpt-4o-mini",           # fast & good
+            "gpt-3.5-turbo",         # cheapest
+        ]:
+            res = call_openai_compatible(
+                "https://aipipe.org/openai/v1",
+                AIPIPE_API_KEY,
+                model,
+                messages,
+                tools if use_tools else None
+            )
+            if res is not None:
+                if res == "SKIP_PROVIDER":
+                    log("  AiPipe OpenAI proxy returned 402 – skipping remaining OpenAI models.")
+                    break
+                return res
+
+        # --- b) OpenRouter models via aipipe.org/openrouter/v1 ---
+        if True:   # only if we didn't already get a SKIP_PROVIDER from OpenAI? We'll just try anyway,
+                   # but if we already skipped due to 402, it's likely same credit issue, so we break.
+            # If the OpenAI proxy returned SKIP_PROVIDER, the whole AiPipe account likely lacks credits,
+            # so we can skip the rest of AiPipe entirely.
+            if res == "SKIP_PROVIDER":
+                log("  AiPipe account seems out of credits – skipping OpenRouter proxy as well.")
+            else:
+                for model in [
+                    "openai/gpt-4.1-nano",        # very cheap, capable
+                    "openai/gpt-4o-mini",         # same as above but via OpenRouter
+                    "anthropic/claude-3-haiku",   # fast, cheap, accurate
+                ]:
+                    res = call_openai_compatible(
+                        "https://aipipe.org/openrouter/v1",
+                        AIPIPE_API_KEY,
+                        model,
+                        messages,
+                        tools if use_tools else None
+                    )
+                    if res is not None:
+                        if res == "SKIP_PROVIDER":
+                            log("  AiPipe OpenRouter proxy returned 402 – skipping remaining OpenRouter models.")
+                            break
+                        return res
+
+    # ===== 2. Groq (free, fast) =====
     if GROQ_API_KEY:
         log("  [Groq]")
         for model in [
@@ -228,21 +276,7 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # --- 2. Together AI (free) ---
-    if TOGETHER_API_KEY:
-        log("  [Together]")
-        for model in ["meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"]:
-            res = call_openai_compatible(
-                "https://api.together.xyz/v1",
-                TOGETHER_API_KEY,
-                model,
-                messages,
-                tools if use_tools else None
-            )
-            if res is not None:
-                return res
-
-    # --- 3. OpenRouter direct (free models) ---
+    # ===== 3. OpenRouter direct (free models) =====
     if OPENROUTER_API_KEY:
         log("  [OpenRouter direct]")
         for model in [
@@ -261,33 +295,12 @@ def call_llm(messages, tools=None, retry=True):
             if res is not None:
                 return res
 
-    # --- 4. HuggingFace (text only, no tools) ---
+    # ===== 4. HuggingFace (text only, no tools) =====
     if not use_tools and HF_API_KEY:
         log("  [HuggingFace]")
         for model in ["mistralai/Mistral-7B-Instruct-v0.3"]:
             res = call_huggingface(model, messages)
             if res is not None:
-                return res
-
-    # --- 5. AiPipe (last resort, skip if out of credits) ---
-    if AIPIPE_API_KEY:
-        log("  [AiPipe]")
-        for model in [
-            "openai/gpt-4.1-nano",
-            "openai/gpt-4o-mini",
-            "anthropic/claude-3-haiku",
-        ]:
-            res = call_openai_compatible(
-                "https://aipipe.org/openrouter/v1",
-                AIPIPE_API_KEY,
-                model,
-                messages,
-                tools if use_tools else None
-            )
-            if res is not None:
-                if res == "SKIP_PROVIDER":
-                    log("  AiPipe returned 402 – skipping remaining AiPipe models.")
-                    break
                 return res
 
     # --- Retry once after a short delay ---
