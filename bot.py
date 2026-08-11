@@ -212,7 +212,12 @@ def call_llm(messages, tools=None, retry=True):
     # --- 1. Groq (free, fast) ---
     if GROQ_API_KEY:
         log("  [Groq]")
-        for model in ["llama-3.1-8b-instant", "mixtral-8x7b-32768"]:
+        for model in [
+            "llama-3.1-8b-instant",
+            "llama-3.3-70b-versatile",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it",
+        ]:
             res = call_openai_compatible(
                 "https://api.groq.com/openai/v1",
                 GROQ_API_KEY,
